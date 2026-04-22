@@ -142,6 +142,24 @@ class TestRealImageFlow:
         assert set(bits) <= {"0", "1"}
         assert len(bits) > 0
 
+    def test_large_encoded_txt_roundtrip(self, tmp_path: Path):
+        """Reproduce el flujo: cargar imagen -> codificar -> guardar .txt ->
+        cargar .txt -> decodificar. Prueba con un texto mayor a DISPLAY_LIMIT
+        para asegurar que el truncado de pantalla no afecta la decodificacion."""
+        original = LOGO_PATH.read_bytes()
+        encoded = encode(original)
+
+        # Para una imagen real el texto codificado supera holgadamente DISPLAY_LIMIT
+        import gui
+        assert len(encoded) > gui.DISPLAY_LIMIT
+
+        txt_path = tmp_path / "logo-test.huff.txt"
+        txt_path.write_text(encoded, encoding="utf-8")
+
+        loaded = txt_path.read_text(encoding="utf-8")
+        assert loaded == encoded
+        assert decode(loaded) == original
+
     def test_logo_double_roundtrip(self, tmp_path: Path):
         original = LOGO_PATH.read_bytes()
 

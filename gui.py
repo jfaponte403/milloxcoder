@@ -6,7 +6,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, font as tkfont, messagebox, scrolledtext, ttk
 
-from huffman import ALGORITHM_NAME, Node, decode, encode
+from huffman import ALGORITHM_NAME, FORMAT_HEADER, Node, decode, encode
 
 
 def _pick_font() -> str:
@@ -228,9 +228,9 @@ class App:
             ("Decodificar", self.do_decode),
         ]
         secondary = [
-            ("Cargar .txt codificado", self.load_encoded),
-            ("Guardar .txt", self.save_encoded),
-            ("Guardar media", self.save_decoded),
+            ("Cargar archivo codificado", self.load_encoded),
+            ("Guardar archivo codificado", self.save_encoded),
+            ("Restaurar media codificada", self.save_decoded),
             ("Copiar", self.copy_output),
             ("Limpiar", self.clear),
         ]
@@ -262,6 +262,7 @@ class App:
         self._build_process_tab(nb)
         self._build_tree_tab(nb)
         self._build_output_tab(nb)
+        self._build_preview_tab(nb)
 
         # Barra de estado
         self.status_var = tk.StringVar(value="Listo.")
@@ -377,6 +378,31 @@ class App:
             bg="#ffffff", fg=COL_TEXT, relief="flat", borderwidth=0, padx=10, pady=8,
         )
         self.out_text.pack(fill=tk.BOTH, expand=True)
+
+    def _build_preview_tab(self, nb: ttk.Notebook) -> None:
+        frame = ttk.Frame(nb, style="Card.TFrame", padding=10)
+        nb.add(frame, text="  Previsualizacion  ")
+
+        top = ttk.Frame(frame, style="Card.TFrame")
+        top.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(top,
+                  text="Imagen reconstruida a partir de los bytes decodificados",
+                  style="Sub.TLabel").pack(side=tk.LEFT)
+
+        self.preview_info = tk.StringVar(value="")
+        ttk.Label(top, textvariable=self.preview_info, style="Muted.TLabel").pack(side=tk.RIGHT)
+
+        wrap = tk.Frame(frame, bg=COL_BORDER, bd=1)
+        wrap.pack(fill=tk.BOTH, expand=True)
+        self.preview_canvas = tk.Canvas(
+            wrap, bg="#fcfcfc", highlightthickness=0,
+        )
+        self.preview_canvas.pack(fill=tk.BOTH, expand=True)
+        self.preview_canvas.bind("<Configure>", lambda e: self._refresh_preview())
+
+        self._preview_source: bytes | None = None
+        self._preview_photo = None  # mantener referencia para que Tk no la libere
+        self._draw_preview_placeholder("Codifica o decodifica una imagen para verla aqui.")
 
     # ---------------- arbol ----------------
 
@@ -709,6 +735,65 @@ class App:
             if k in self.metric_vars:
                 self.metric_vars[k].set(v)
 
+    def _draw_preview_placeholder(self, msg: str) -> None:
+        c = self.preview_canvas
+        c.delete("all")
+        c.update_idletasks()
+        w = max(c.winfo_width(), 1)
+        h = max(c.winfo_height(), 1)
+        c.create_text(w / 2, h / 2, text=msg, fill=COL_MUTED,
+                      font=(FONT_FAMILY, 10), width=w - 40)
+        self.preview_info.set("")
+
+    def _set_preview(self, data: bytes | None) -> None:
+        self._preview_source = data
+        self._refresh_preview()
+
+    def _refresh_preview(self) -> None:
+        data = self._preview_source
+        if not data:
+            self._draw_preview_placeholder("Codifica o decodifica una imagen para verla aqui.")
+            return
+
+        try:
+            from PIL import Image, ImageTk
+        except ImportError:
+            self._draw_preview_placeholder(
+                "Instala Pillow (pip install Pillow) para previsualizar la imagen."
+            )
+            return
+
+        import io
+        try:
+            img = Image.open(io.BytesIO(data))
+            img.load()
+        except Exception:
+            self._draw_preview_placeholder(
+                f"Los {len(data):,} bytes decodificados no son una imagen reconocible.\n"
+                "(Si cargaste audio u otro tipo de archivo, esto es normal.)"
+            )
+            return
+
+        c = self.preview_canvas
+        c.delete("all")
+        c.update_idletasks()
+        cw = max(c.winfo_width(), 1)
+        ch = max(c.winfo_height(), 1)
+
+        iw, ih = img.size
+        scale = min((cw - 20) / iw, (ch - 20) / ih, 1.0)
+        if scale < 1.0:
+            new_size = (max(1, int(iw * scale)), max(1, int(ih * scale)))
+            display_img = img.resize(new_size, Image.LANCZOS)
+        else:
+            display_img = img
+
+        self._preview_photo = ImageTk.PhotoImage(display_img)
+        c.create_image(cw / 2, ch / 2, image=self._preview_photo, anchor="center")
+        self.preview_info.set(
+            f"{img.format or '?'}  ·  {iw}x{ih} px  ·  {len(data):,} bytes"
+        )
+
     def _capture_tree(self, root: Node, codes: dict, freqs: dict) -> None:
         self.current_root = root
         self.current_codes = codes
@@ -746,6 +831,7 @@ class App:
                              bits="—", output="—", ratio="—")
         self.log(f"Archivo cargado: {p}")
         self.log(f"Tamano: {len(data)} bytes")
+        self._set_preview(data)
         self._status(f"'{p.name}' cargado. Pulsa 'Codificar'.")
 
     def do_encode(self) -> None:
@@ -799,14 +885,27 @@ class App:
         self.decoded_bytes = None
         self._set_output(text)
         self.info_var.set(f"{Path(path).name}  ·  {len(text):,} caracteres codificados")
+        self._set_preview(None)
         self._status("Texto codificado cargado. Pulsa 'Decodificar'.")
 
     def do_decode(self) -> None:
-        text = self.encoded_text
         pasted = self.out_text.get("1.0", tk.END).strip()
-        if pasted and (not text or pasted != (text[:DISPLAY_LIMIT] if len(text) > DISPLAY_LIMIT else text)):
-            if not text or not pasted.endswith("(mostrando los primeros"):
-                text = pasted
+        panel_is_preview = (
+            self.encoded_text is not None
+            and "... (mostrando los primeros" in pasted
+        )
+
+        if self.encoded_text and panel_is_preview:
+            # El panel muestra el preview truncado; usar el texto completo en memoria
+            text = self.encoded_text
+        elif pasted.startswith(FORMAT_HEADER):
+            # El usuario pego contenido nuevo con cabecera valida
+            text = pasted
+        elif self.encoded_text:
+            text = self.encoded_text
+        else:
+            text = pasted
+
         if not text:
             messagebox.showwarning("Nada que decodificar", "Carga o pega un texto codificado primero.")
             return
@@ -822,6 +921,7 @@ class App:
         finally:
             self.root.config(cursor="")
         self.decoded_bytes = data
+        self._set_preview(data)
         self._update_metrics(
             input=f"{len(text):,} ch",
             symbols=str(len(self.current_freqs or {})),
@@ -839,9 +939,7 @@ class App:
         if not self.encoded_text:
             messagebox.showwarning("Nada que guardar", "Primero codifica un archivo.")
             return
-        default = "encoded.txt"
-        if self.loaded_path:
-            default = self.loaded_path.stem + ".huff.txt"
+        default = "media-codificada.txt"
         path = filedialog.asksaveasfilename(
             title="Guardar resultado codificado",
             defaultextension=".txt",
@@ -899,6 +997,7 @@ class App:
         self._reset_steps()
         self._update_metrics(input="—", symbols="—", bits="—", output="—", ratio="—")
         self._draw_tree_placeholder()
+        self._set_preview(None)
         self._status("Listo.")
 
 
