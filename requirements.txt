@@ -1,0 +1,7 @@
+# Tkinter viene incluido en Python en Windows/macOS.
+# En Linux: sudo apt install python3-tk (o equivalente).
+# Pillow se usa para exportar el arbol de Huffman a PNG/JPEG.
+Pillow>=10.0
+
+# Pytest para la suite de tests en tests/.
+pytest>=8.0

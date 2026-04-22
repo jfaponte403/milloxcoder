@@ -1,0 +1,30 @@
+# Entorno virtual
+.venv/
+venv/
+env/
+
+# Cache de Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Cache de pytest
+.pytest_cache/
+.cache/
+
+# IDEs
+.idea/
+.vscode/
+
+# Claude Code
+.claude/
+
+# Distribucion / empaquetado
+build/
+dist/
+*.egg-info/
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
