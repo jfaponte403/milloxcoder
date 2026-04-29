@@ -4,6 +4,7 @@ visualizacion paso a paso y dashboard de teoria de la informacion."""
 from __future__ import annotations
 
 import io
+import json
 import math
 import tkinter as tk
 from pathlib import Path
@@ -48,6 +49,10 @@ MONO_FAMILY = "Consolas"
 
 MEDIA_EXTENSIONS = ".png .jpg .jpeg .gif .bmp .tiff .webp .wav .mp3 .ogg .flac .m4a .aac"
 DISPLAY_LIMIT = 60_000
+
+# Glifo neutro para metricas sin valor todavia. Middle dot, no em dash:
+# DESIGN.md prohibe em dashes y `--` en copy.
+EMPTY_VALUE = "·"
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +318,7 @@ class App:
 
         self.loaded_bytes: bytes | None = None
         self.loaded_path: Path | None = None
+        self.encoded_source_path: Path | None = None
         self.encoded_text: str | None = None
         self.decoded_bytes: bytes | None = None
         self.current_root: Node | None = None
@@ -411,12 +417,12 @@ class App:
                         tabmargins=(0, 4, 0, 0))
         style.configure("TNotebook.Tab",
                         background=COL_BG, foreground=COL_MUTED,
-                        padding=(20, 11), borderwidth=0, font=(f, 10, "bold"))
+                        padding=(16, 9), borderwidth=0, font=(f, 10, "bold"))
         style.map(
             "TNotebook.Tab",
             background=[("selected", COL_BG), ("active", COL_BG)],
             foreground=[("selected", COL_ACCENT), ("active", COL_INK)],
-            padding=[("selected", (20, 11)), ("!selected", (20, 11))],
+            padding=[("selected", (16, 9)), ("!selected", (16, 9))],
             expand=[("selected", [0, 0, 0, 0])],
         )
 
@@ -503,7 +509,6 @@ class App:
             ("Guardar codificado", self.save_encoded),
             ("Restaurar media", self.save_decoded),
             ("Copiar resultado", self.copy_output),
-            ("Limpiar", self.clear),
         ]
         for label, cmd in secondary:
             RoundedButton(
@@ -512,6 +517,14 @@ class App:
                 hover_bg=COL_BORDER_SUBTLE, active_bg=COL_BORDER,
                 parent_bg=COL_BG, padx=14, pady=8,
             ).pack(side=tk.LEFT, padx=(0, 6))
+
+        # Limpiar es destructivo: ghost para que no compita con las demas.
+        RoundedButton(
+            secondary_row, text="Limpiar", command=self.clear,
+            bg=COL_BG, fg=COL_MUTED,
+            hover_bg=COL_BORDER_SUBTLE, active_bg=COL_BORDER,
+            parent_bg=COL_BG, padx=14, pady=8,
+        ).pack(side=tk.LEFT, padx=(0, 6))
 
     def _build_filebar(self, parent: ttk.Frame) -> None:
         bar = tk.Frame(parent, bg=COL_RAISED, highlightthickness=0)
@@ -598,11 +611,11 @@ class App:
         metrics_row.pack(fill=tk.X, pady=(0, 18))
 
         self.metric_vars = {
-            "input": tk.StringVar(value="—"),
-            "output": tk.StringVar(value="—"),
-            "symbols": tk.StringVar(value="—"),
-            "bits": tk.StringVar(value="—"),
-            "ratio": tk.StringVar(value="—"),
+            "input": tk.StringVar(value=EMPTY_VALUE),
+            "output": tk.StringVar(value=EMPTY_VALUE),
+            "symbols": tk.StringVar(value=EMPTY_VALUE),
+            "bits": tk.StringVar(value=EMPTY_VALUE),
+            "ratio": tk.StringVar(value=EMPTY_VALUE),
         }
 
         # Dos prominentes
@@ -749,7 +762,7 @@ class App:
             ctx_inner, text="FUENTE ANALIZADA", bg=COL_RAISED,
             fg=COL_MUTED, font=(FONT_FAMILY, 8, "bold"),
         ).pack(anchor="w")
-        self.analysis_source_var = tk.StringVar(value="—")
+        self.analysis_source_var = tk.StringVar(value=EMPTY_VALUE)
         tk.Label(
             ctx_inner, textvariable=self.analysis_source_var,
             bg=COL_RAISED, fg=COL_INK, font=(FONT_FAMILY, 11, "bold"),
@@ -763,14 +776,14 @@ class App:
         main_row.pack(fill=tk.X)
 
         self.analysis_vars = {
-            "H": tk.StringVar(value="—"),
-            "L": tk.StringVar(value="—"),
-            "R": tk.StringVar(value="—"),
-            "eta": tk.StringVar(value="—"),
-            "sigma2": tk.StringVar(value="—"),
-            "sigma": tk.StringVar(value="—"),
-            "min_len": tk.StringVar(value="—"),
-            "max_len": tk.StringVar(value="—"),
+            "H": tk.StringVar(value=EMPTY_VALUE),
+            "L": tk.StringVar(value=EMPTY_VALUE),
+            "R": tk.StringVar(value=EMPTY_VALUE),
+            "eta": tk.StringVar(value=EMPTY_VALUE),
+            "sigma2": tk.StringVar(value=EMPTY_VALUE),
+            "sigma": tk.StringVar(value=EMPTY_VALUE),
+            "min_len": tk.StringVar(value=EMPTY_VALUE),
+            "max_len": tk.StringVar(value=EMPTY_VALUE),
         }
 
         self._make_analysis_card(
@@ -1218,25 +1231,394 @@ class App:
         inner = tk.Frame(frame, bg=COL_BG)
         inner.pack(fill=tk.BOTH, expand=True, padx=4, pady=12)
 
+        # Grid: header, chips, eficacia, eyebrow bits, panel bits (peso 2),
+        #       eyebrow json, panel json (peso 1).
+        inner.columnconfigure(0, weight=1)
+        inner.rowconfigure(4, weight=2, minsize=180)
+        inner.rowconfigure(6, weight=1, minsize=120)
+
+        # StringVars del strip de eficacia.
+        self.output_compression_var = tk.StringVar(value=EMPTY_VALUE)
+        self.output_savings_var = tk.StringVar(value=EMPTY_VALUE)
+        self.output_verify_var = tk.StringVar(value=EMPTY_VALUE)
+        self.output_verify_sub_var = tk.StringVar(value="tras decodificar")
+
+        # --- Header zone ---
+        head = tk.Frame(inner, bg=COL_BG)
+        head.grid(row=0, column=0, sticky="ew", pady=(0, 14))
+
+        head_text = tk.Frame(head, bg=COL_BG)
+        head_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Label(
-            inner, text="TEXTO CODIFICADO", style="Eyebrow.TLabel",
-        ).pack(anchor="w", pady=(0, 4))
+            head_text, text="TEXTO CODIFICADO", style="Eyebrow.TLabel",
+        ).pack(anchor="w")
         ttk.Label(
-            inner,
-            text="JSON con cabecera HUFFMAN_v1. Copiable, pegable y "
-                 "guardable como .txt.",
+            head_text,
+            text="Cabecera, secuencia de bits y metadatos JSON, "
+                 "cada uno en su propio panel.",
             style="Subhead.TLabel",
-        ).pack(anchor="w", pady=(0, 10))
+        ).pack(anchor="w", pady=(2, 0))
 
-        wrap = tk.Frame(inner, bg=COL_BORDER, highlightthickness=0)
-        wrap.pack(fill=tk.BOTH, expand=True)
+        head_actions = tk.Frame(head, bg=COL_BG)
+        head_actions.pack(side=tk.RIGHT, pady=(8, 0))
+        RoundedButton(
+            head_actions, text="Pegar texto crudo...",
+            command=self._paste_encoded_dialog,
+            bg=COL_BG, fg=COL_MUTED,
+            hover_bg=COL_BORDER_SUBTLE, active_bg=COL_BORDER,
+            parent_bg=COL_BG, padx=12, pady=7,
+        ).pack()
 
-        self.out_text = scrolledtext.ScrolledText(
-            wrap, wrap=tk.WORD, font=(MONO_FAMILY, 9),
+        # --- Chips zone ---
+        self.output_chip_row = tk.Frame(inner, bg=COL_BG)
+        self.output_chip_row.grid(row=1, column=0, sticky="ew", pady=(0, 14))
+
+        # --- Eficacia strip (tasa, ahorro, verificacion) ---
+        eff_box = tk.Frame(inner, bg=COL_RAISED)
+        eff_box.grid(row=2, column=0, sticky="ew", pady=(0, 22))
+        eff_grid = tk.Frame(eff_box, bg=COL_RAISED)
+        eff_grid.pack(fill=tk.X)
+        for col in (0, 2, 4):
+            eff_grid.columnconfigure(col, weight=1, uniform="eff")
+
+        self._build_eff_cell(
+            eff_grid, 0, "TASA DE COMPRESION",
+            sub_text="del tamano original",
+            value_var=self.output_compression_var,
+            on_click=lambda: self._show_efficacy_modal("compression"),
+        )
+        tk.Frame(eff_grid, bg=COL_BORDER_SUBTLE, width=1).grid(
+            row=0, column=1, sticky="ns", pady=14,
+        )
+        self._build_eff_cell(
+            eff_grid, 2, "AHORRO",
+            sub_text="del flujo de bits",
+            value_var=self.output_savings_var,
+            on_click=lambda: self._show_efficacy_modal("savings"),
+        )
+        tk.Frame(eff_grid, bg=COL_BORDER_SUBTLE, width=1).grid(
+            row=0, column=3, sticky="ns", pady=14,
+        )
+        self._build_eff_cell(
+            eff_grid, 4, "VERIFICACION",
+            sub_var=self.output_verify_sub_var,
+            value_var=self.output_verify_var,
+            on_click=lambda: self._show_efficacy_modal("verification"),
+        )
+
+        # --- Bits panel ---
+        bits_eyebrow_row = tk.Frame(inner, bg=COL_BG)
+        bits_eyebrow_row.grid(row=3, column=0, sticky="ew", pady=(0, 6))
+        ttk.Label(
+            bits_eyebrow_row, text="SECUENCIA DE BITS",
+            style="Eyebrow.TLabel",
+        ).pack(side=tk.LEFT)
+        self._add_expand_link(
+            bits_eyebrow_row, "VER COMPLETO  →", self._show_bits_modal,
+        )
+        self.output_bits_count_var = tk.StringVar(value="")
+        ttk.Label(
+            bits_eyebrow_row, textvariable=self.output_bits_count_var,
+            style="Muted.TLabel",
+        ).pack(side=tk.RIGHT)
+
+        bits_wrap = tk.Frame(inner, bg=COL_BORDER, highlightthickness=0)
+        bits_wrap.grid(row=4, column=0, sticky="nsew", pady=(0, 20))
+
+        self.bits_text = scrolledtext.ScrolledText(
+            bits_wrap, wrap=tk.CHAR, font=(MONO_FAMILY, 11),
+            bg=COL_SURFACE, fg=COL_INK, insertbackground=COL_INK,
+            relief="flat", borderwidth=0, padx=18, pady=14,
+            spacing1=2, spacing2=4, spacing3=2,
+        )
+        self.bits_text.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+        self.bits_text.tag_configure("hint", foreground=COL_SUBTLE,
+                                     font=(MONO_FAMILY, 9, "italic"))
+        self.bits_text.tag_configure("note", foreground=COL_MUTED,
+                                     font=(FONT_FAMILY, 9))
+
+        # --- JSON metadata panel ---
+        json_eyebrow_row = tk.Frame(inner, bg=COL_BG)
+        json_eyebrow_row.grid(row=5, column=0, sticky="ew", pady=(0, 6))
+        ttk.Label(
+            json_eyebrow_row, text="METADATOS DEL CODIFICADO",
+            style="Eyebrow.TLabel",
+        ).pack(side=tk.LEFT)
+        ttk.Label(
+            json_eyebrow_row,
+            text="JSON. Lo que el decoder necesita para reconstruir el arbol.",
+            style="Muted.TLabel",
+        ).pack(side=tk.LEFT, padx=(12, 0))
+        self._add_expand_link(
+            json_eyebrow_row, "VER COMPLETO  →", self._show_json_modal,
+            side=tk.RIGHT, padx=(0, 0),
+        )
+
+        json_wrap = tk.Frame(inner, bg=COL_BORDER, highlightthickness=0)
+        json_wrap.grid(row=6, column=0, sticky="nsew")
+
+        self.json_text = scrolledtext.ScrolledText(
+            json_wrap, wrap=tk.WORD, font=(MONO_FAMILY, 9),
             bg=COL_SURFACE, fg=COL_INK, insertbackground=COL_INK,
             relief="flat", borderwidth=0, padx=14, pady=12,
         )
-        self.out_text.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+        self.json_text.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+        self.json_text.tag_configure("hint", foreground=COL_SUBTLE,
+                                     font=(MONO_FAMILY, 9, "italic"))
+
+        # Estado vacio inicial.
+        self._clear_output_panels()
+
+    # ---- Output panels: helpers ----
+
+    def _add_expand_link(self, parent: tk.Frame, text: str, on_click,
+                         side=tk.LEFT, padx=(14, 0)) -> tk.Label:
+        lbl = tk.Label(
+            parent, text=text, bg=COL_BG, fg=COL_ACCENT,
+            font=(FONT_FAMILY, 8, "bold"), cursor="hand2",
+        )
+        lbl.pack(side=side, padx=padx)
+        lbl.bind("<Button-1>", lambda e: on_click())
+        lbl.bind("<Enter>", lambda e: lbl.configure(fg=COL_ACCENT_HOVER))
+        lbl.bind("<Leave>", lambda e: lbl.configure(fg=COL_ACCENT))
+        return lbl
+
+    def _build_eff_cell(self, parent: tk.Frame, col: int, label: str, *,
+                        value_var: tk.StringVar,
+                        sub_text: str | None = None,
+                        sub_var: tk.StringVar | None = None,
+                        on_click=None) -> None:
+        cell = tk.Frame(parent, bg=COL_RAISED)
+        cell.grid(row=0, column=col, sticky="nsew", padx=20, pady=14)
+
+        head_row = tk.Frame(cell, bg=COL_RAISED)
+        head_row.pack(fill=tk.X)
+        tk.Label(
+            head_row, text=label, bg=COL_RAISED, fg=COL_MUTED,
+            font=(FONT_FAMILY, 8, "bold"),
+        ).pack(side=tk.LEFT)
+        if on_click is not None:
+            tk.Label(
+                head_row, text="→", bg=COL_RAISED, fg=COL_ACCENT,
+                font=(FONT_FAMILY, 11, "bold"),
+            ).pack(side=tk.RIGHT)
+
+        tk.Label(
+            cell, textvariable=value_var, bg=COL_RAISED, fg=COL_INK,
+            font=(FONT_FAMILY, 18, "bold"),
+        ).pack(anchor="w", pady=(6, 0))
+        if sub_var is not None:
+            tk.Label(
+                cell, textvariable=sub_var, bg=COL_RAISED, fg=COL_SUBTLE,
+                font=(FONT_FAMILY, 9),
+            ).pack(anchor="w", pady=(2, 0))
+        elif sub_text is not None:
+            tk.Label(
+                cell, text=sub_text, bg=COL_RAISED, fg=COL_SUBTLE,
+                font=(FONT_FAMILY, 9),
+            ).pack(anchor="w", pady=(2, 0))
+
+        if on_click is not None:
+            for w in (cell, head_row, *cell.winfo_children(),
+                      *head_row.winfo_children()):
+                try:
+                    w.configure(cursor="hand2")
+                except tk.TclError:
+                    pass
+                w.bind("<Button-1>", lambda e, cb=on_click: cb(), add="+")
+
+    def _add_chip(self, parent: tk.Frame, text: str, *,
+                  accent: bool = False) -> None:
+        bg = COL_ACCENT_SOFT if accent else COL_RAISED
+        fg = COL_ACCENT_ACTIVE if accent else COL_INK
+        chip = tk.Frame(parent, bg=bg)
+        chip.pack(side=tk.LEFT, padx=(0, 6))
+        tk.Label(
+            chip, text=text, bg=bg, fg=fg,
+            font=(FONT_FAMILY, 8, "bold"),
+            padx=10, pady=5,
+        ).pack()
+
+    @staticmethod
+    def _format_bit_stream(bits: str, group: int = 8,
+                           per_line: int = 8) -> str:
+        """Agrupa bits en bloques de 8 con espacio, y N bloques por linea."""
+        if not bits:
+            return ""
+        chunks = [bits[i:i + group] for i in range(0, len(bits), group)]
+        lines = []
+        for i in range(0, len(chunks), per_line):
+            lines.append(" ".join(chunks[i:i + per_line]))
+        return "\n".join(lines)
+
+    def _set_bits_panel(self, bits: str) -> None:
+        bits = "".join((bits or "").split())
+        self.bits_text.configure(state="normal")
+        self.bits_text.delete("1.0", tk.END)
+        if not bits:
+            self.bits_text.insert(
+                "1.0",
+                "Codifica un archivo para ver aqui su secuencia de bits.\n",
+                "hint",
+            )
+            self.output_bits_count_var.set("")
+            self.bits_text.configure(state="disabled")
+            return
+
+        if len(bits) > DISPLAY_LIMIT:
+            shown = self._format_bit_stream(bits[:DISPLAY_LIMIT])
+            self.bits_text.insert("1.0", shown + "\n\n")
+            self.bits_text.insert(
+                tk.END,
+                f"... {len(bits) - DISPLAY_LIMIT:,} bits mas. "
+                "Usa 'Guardar codificado' o 'Copiar resultado' para "
+                "obtener el flujo completo.\n",
+                "note",
+            )
+            self.output_bits_count_var.set(
+                f"{len(bits):,} bits  ·  mostrando {DISPLAY_LIMIT:,}"
+            )
+        else:
+            self.bits_text.insert("1.0", self._format_bit_stream(bits))
+            self.output_bits_count_var.set(f"{len(bits):,} bits")
+
+        self.bits_text.configure(state="disabled")
+
+    def _set_json_panel(self, payload: str) -> None:
+        self.json_text.configure(state="normal")
+        self.json_text.delete("1.0", tk.END)
+        if not payload:
+            self.json_text.insert(
+                "1.0",
+                "Aqui apareceran las frecuencias y los tamanos del codificado.\n",
+                "hint",
+            )
+            self.json_text.configure(state="disabled")
+            return
+
+        try:
+            parsed = json.loads(payload)
+            pretty = json.dumps(parsed, indent=2, ensure_ascii=False)
+        except Exception:
+            pretty = payload
+
+        if len(pretty) > DISPLAY_LIMIT:
+            self.json_text.insert("1.0", pretty[:DISPLAY_LIMIT])
+            self.json_text.insert(
+                tk.END,
+                f"\n\n... ({len(pretty) - DISPLAY_LIMIT:,} caracteres mas, "
+                "truncado para visualizacion.)",
+                "hint",
+            )
+        else:
+            self.json_text.insert("1.0", pretty)
+
+        self.json_text.configure(state="disabled")
+
+    def _render_output_chips(self, header: str, json_payload: str,
+                             bits: str) -> None:
+        for w in self.output_chip_row.winfo_children():
+            w.destroy()
+
+        symbol_count = 0
+        original_size = 0
+        version = None
+        if json_payload:
+            try:
+                parsed = json.loads(json_payload)
+                symbol_count = len(parsed.get("frequencies", {}) or {})
+                original_size = int(parsed.get("original_size") or 0)
+                version = parsed.get("version")
+            except Exception:
+                pass
+
+        format_label = (header or "SIN CABECERA").strip().upper()
+        if version is not None:
+            self._add_chip(self.output_chip_row,
+                           f"{format_label} · v{version}", accent=True)
+        else:
+            self._add_chip(self.output_chip_row, format_label, accent=True)
+
+        if bits:
+            self._add_chip(self.output_chip_row, f"{len(bits):,} BITS")
+        if symbol_count:
+            self._add_chip(self.output_chip_row,
+                           f"{symbol_count} SIMBOLOS")
+        if original_size:
+            self._add_chip(self.output_chip_row,
+                           f"{original_size:,} B ORIGINALES")
+
+    def _clear_output_panels(self) -> None:
+        for w in self.output_chip_row.winfo_children():
+            w.destroy()
+        tk.Label(
+            self.output_chip_row,
+            text="Sin texto codificado todavia.",
+            bg=COL_BG, fg=COL_SUBTLE, font=(FONT_FAMILY, 9),
+        ).pack(side=tk.LEFT)
+        self.output_compression_var.set(EMPTY_VALUE)
+        self.output_savings_var.set(EMPTY_VALUE)
+        self.output_verify_var.set(EMPTY_VALUE)
+        self.output_verify_sub_var.set("tras decodificar")
+        self._set_bits_panel("")
+        self._set_json_panel("")
+
+    def _update_efficiency_strip(self, json_payload: str, bits: str) -> None:
+        """Calcula TASA y AHORRO desde el JSON. La verificacion se actualiza
+        aparte cuando se decodifica."""
+        original_size = 0
+        bit_length = 0
+        if json_payload:
+            try:
+                parsed = json.loads(json_payload)
+                original_size = int(parsed.get("original_size") or 0)
+                bit_length = int(parsed.get("bit_length") or 0)
+            except Exception:
+                pass
+        if not bit_length:
+            bit_length = len(bits or "")
+
+        if original_size > 0 and bit_length > 0:
+            rate = bit_length / (original_size * 8) * 100
+            self.output_compression_var.set(f"{rate:.1f} %")
+            self.output_savings_var.set(f"{max(0.0, 100 - rate):.1f} %")
+        else:
+            self.output_compression_var.set(EMPTY_VALUE)
+            self.output_savings_var.set(EMPTY_VALUE)
+
+    def _update_verification(self) -> None:
+        """Compara los bytes decodificados con el tamano original del JSON.
+
+        Se llama tras `do_decode`. Si no hay decodificado todavia, deja la
+        celda en estado pendiente.
+        """
+        if self.decoded_bytes is None or not self.encoded_text:
+            self.output_verify_var.set(EMPTY_VALUE)
+            self.output_verify_sub_var.set("tras decodificar")
+            return
+
+        parts = self.encoded_text.split("\n", 2)
+        expected = 0
+        if len(parts) >= 2:
+            try:
+                parsed = json.loads(parts[1])
+                expected = int(parsed.get("original_size") or 0)
+            except Exception:
+                expected = 0
+
+        got = len(self.decoded_bytes)
+        if expected > 0:
+            pct = got / expected * 100
+            if got == expected:
+                self.output_verify_var.set("100.0 % ✓")
+            else:
+                self.output_verify_var.set(f"{pct:.1f} %")
+            self.output_verify_sub_var.set(
+                f"{got:,} / {expected:,} bytes recuperados"
+            )
+        else:
+            self.output_verify_var.set(f"{got:,} B")
+            self.output_verify_sub_var.set("sin tamano de referencia")
 
     # ------------------------------------------------------------------
     # Tab: previsualizacion
@@ -1598,17 +1980,128 @@ class App:
         self.log_text.update_idletasks()
 
     def _set_output(self, text: str) -> None:
-        self.out_text.delete("1.0", tk.END)
-        if len(text) <= DISPLAY_LIMIT:
-            self.out_text.insert("1.0", text)
-        else:
-            self.out_text.insert(
-                "1.0",
-                text[:DISPLAY_LIMIT]
-                + f"\n\n... (mostrando los primeros {DISPLAY_LIMIT} "
-                f"caracteres de {len(text)}. Usa 'Copiar resultado' o "
-                "'Guardar codificado' para obtener el texto completo.)",
+        """Pone el texto codificado en los paneles estructurados.
+
+        Formato esperado: tres lineas (cabecera, JSON, bitstream). Si la
+        entrada no las trae, se pueblan los paneles con lo que haya.
+        """
+        text = (text or "").strip()
+        if not text:
+            self._clear_output_panels()
+            return
+
+        parts = text.split("\n", 2)
+        header = parts[0].strip() if parts else ""
+        json_payload = parts[1] if len(parts) > 1 else ""
+        bits = parts[2] if len(parts) > 2 else ""
+
+        self._render_output_chips(header, json_payload, bits)
+        self._update_efficiency_strip(json_payload, bits)
+        self._update_verification()
+        self._set_bits_panel(bits)
+        self._set_json_panel(json_payload)
+
+    def _paste_encoded_dialog(self) -> None:
+        """Abre un Toplevel con un textarea para pegar texto codificado crudo."""
+        win = tk.Toplevel(self.root)
+        win.title("Pegar texto codificado")
+        win.configure(bg=COL_BG)
+        win.transient(self.root)
+        win.minsize(620, 420)
+
+        self.root.update_idletasks()
+        rx = self.root.winfo_rootx()
+        ry = self.root.winfo_rooty()
+        rw = self.root.winfo_width()
+        rh = self.root.winfo_height()
+        ww, wh = 720, 540
+        x = rx + (rw - ww) // 2
+        y = ry + (rh - wh) // 2
+        win.geometry(f"{ww}x{wh}+{max(0, x)}+{max(0, y)}")
+
+        head = tk.Frame(win, bg=COL_BG)
+        head.pack(fill=tk.X, padx=24, pady=(20, 8))
+        ttk.Label(head, text="PEGAR TEXTO CRUDO",
+                  style="Eyebrow.TLabel").pack(anchor="w")
+        ttk.Label(
+            head,
+            text=f"Pega aqui el contenido completo de un .txt codificado, "
+                 f"empezando por '{FORMAT_HEADER}'.",
+            style="Subhead.TLabel",
+        ).pack(anchor="w", pady=(2, 0))
+
+        tk.Frame(win, bg=COL_BORDER_SUBTLE, height=1).pack(
+            fill=tk.X, padx=24, pady=(12, 0)
+        )
+
+        body = tk.Frame(win, bg=COL_BG)
+        body.pack(fill=tk.BOTH, expand=True, padx=24, pady=14)
+        paste_wrap = tk.Frame(body, bg=COL_BORDER, highlightthickness=0)
+        paste_wrap.pack(fill=tk.BOTH, expand=True)
+        txt = scrolledtext.ScrolledText(
+            paste_wrap, wrap=tk.CHAR, font=(MONO_FAMILY, 9),
+            bg=COL_SURFACE, fg=COL_INK, insertbackground=COL_INK,
+            relief="flat", borderwidth=0, padx=14, pady=12,
+        )
+        txt.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+        txt.focus_set()
+
+        try:
+            clip = self.root.clipboard_get()
+            if clip and clip.strip().startswith(FORMAT_HEADER):
+                txt.insert("1.0", clip)
+        except tk.TclError:
+            pass
+
+        foot = tk.Frame(win, bg=COL_BG)
+        foot.pack(fill=tk.X, padx=24, pady=(0, 20))
+
+        def confirm() -> None:
+            content = txt.get("1.0", tk.END).strip()
+            if not content:
+                messagebox.showwarning(
+                    "Vacio", "Pega contenido primero.",
+                )
+                return
+            if not content.startswith(FORMAT_HEADER):
+                if not messagebox.askyesno(
+                    "Cabecera no reconocida",
+                    f"El texto no empieza con '{FORMAT_HEADER}'. "
+                    "¿Cargarlo de todos modos?",
+                ):
+                    return
+            self.encoded_text = content
+            self.encoded_source_path = None
+            self.loaded_path = None
+            self.loaded_bytes = None
+            self.decoded_bytes = None
+            self.info_var.set(
+                f"Texto pegado  ·  {len(content):,} caracteres codificados"
             )
+            self._set_output(content)
+            self._set_preview(None)
+            self.current_metrics = None
+            self._refresh_analysis()
+            self._status(
+                "Texto codificado cargado. Pulsa 'Decodificar'.",
+                color=COL_OK,
+            )
+            win.destroy()
+
+        RoundedButton(
+            foot, text="Cargar", command=confirm, bold=True,
+            bg=COL_ACCENT, fg="#FFFFFF",
+            hover_bg=COL_ACCENT_HOVER, active_bg=COL_ACCENT_ACTIVE,
+            parent_bg=COL_BG, padx=22, pady=10,
+        ).pack(side=tk.RIGHT)
+        RoundedButton(
+            foot, text="Cancelar", command=win.destroy,
+            bg=COL_BG, fg=COL_MUTED,
+            hover_bg=COL_BORDER_SUBTLE, active_bg=COL_BORDER,
+            parent_bg=COL_BG, padx=18, pady=10,
+        ).pack(side=tk.RIGHT, padx=(0, 8))
+
+        win.bind("<Escape>", lambda e: win.destroy())
 
     def _status(self, msg: str, color: str = COL_OK) -> None:
         self.status_var.set(msg)
@@ -2313,6 +2806,520 @@ class App:
         text.insert(tk.END, f"  max |c| = {max_len} bits\n", "result")
 
     # ------------------------------------------------------------------
+    # Modales del tab Resultado
+    # ------------------------------------------------------------------
+
+    _BITS_MODAL_LIMIT = 200_000
+
+    _EFFICACY_TITLES = {
+        "compression": ("Tasa de compresion", "T", "TASA DE COMPRESION"),
+        "savings":     ("Ahorro de bits",     "A", "AHORRO"),
+        "verification":("Verificacion de round-trip", "V", "VERIFICACION"),
+    }
+
+    def _modal_window(self, title: str, *, ww: int = 820, wh: int = 600,
+                      min_w: int = 720, min_h: int = 520) -> tk.Toplevel:
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.configure(bg=COL_BG)
+        win.transient(self.root)
+        win.minsize(min_w, min_h)
+
+        self.root.update_idletasks()
+        rx = self.root.winfo_rootx()
+        ry = self.root.winfo_rooty()
+        rw = max(self.root.winfo_width(), ww)
+        rh = max(self.root.winfo_height(), wh)
+        x = rx + (rw - ww) // 2
+        y = ry + (rh - wh) // 2
+        win.geometry(f"{ww}x{wh}+{max(0, x)}+{max(0, y)}")
+
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.focus_set()
+        return win
+
+    def _modal_close_footer(self, win: tk.Toplevel) -> None:
+        foot = tk.Frame(win, bg=COL_BG)
+        foot.pack(fill=tk.X, padx=24, pady=(0, 20), side=tk.BOTTOM)
+        RoundedButton(
+            foot, text="Cerrar", command=win.destroy, bold=True,
+            bg=COL_ACCENT, fg="#FFFFFF",
+            hover_bg=COL_ACCENT_HOVER, active_bg=COL_ACCENT_ACTIVE,
+            parent_bg=COL_BG, padx=22, pady=10,
+        ).pack(side=tk.RIGHT)
+
+    def _parse_encoded_meta(self) -> dict:
+        """Lee encoded_text y devuelve original_size, bit_length, bits y JSON
+        parseado. Devuelve dict vacio si no hay encoded_text valido."""
+        if not self.encoded_text:
+            return {}
+        parts = self.encoded_text.split("\n", 2)
+        if len(parts) < 2:
+            return {}
+        try:
+            parsed = json.loads(parts[1])
+        except Exception:
+            parsed = {}
+        bits = "".join((parts[2] if len(parts) > 2 else "").split())
+        return {
+            "original_size": int(parsed.get("original_size") or 0),
+            "bit_length": int(parsed.get("bit_length") or 0) or len(bits),
+            "frequencies": parsed.get("frequencies", {}) or {},
+            "bits": bits,
+            "version": parsed.get("version"),
+        }
+
+    # ---- Bits modal (vista expandida del bitstream) ----
+
+    def _show_bits_modal(self) -> None:
+        if not self.encoded_text:
+            messagebox.showinfo(
+                "Sin datos",
+                "Codifica un archivo o pega texto codificado primero.",
+            )
+            return
+
+        meta = self._parse_encoded_meta()
+        bits = meta.get("bits", "")
+        if not bits:
+            messagebox.showinfo("Sin bits",
+                                "El texto codificado no tiene bitstream.")
+            return
+
+        win = self._modal_window(
+            "Secuencia de bits · vista expandida",
+            ww=960, wh=680, min_w=820, min_h=540,
+        )
+
+        head = tk.Frame(win, bg=COL_BG)
+        head.pack(fill=tk.X, padx=24, pady=(20, 6))
+        ttk.Label(head, text="SECUENCIA DE BITS",
+                  style="Eyebrow.TLabel").pack(anchor="w")
+        title_row = tk.Frame(head, bg=COL_BG)
+        title_row.pack(fill=tk.X, pady=(2, 0))
+        tk.Label(
+            title_row, text=f"{len(bits):,}",
+            bg=COL_BG, fg=COL_INK, font=(FONT_FAMILY, 22, "bold"),
+        ).pack(side=tk.LEFT)
+        tk.Label(
+            title_row, text="  bits del archivo codificado",
+            bg=COL_BG, fg=COL_MUTED, font=(FONT_FAMILY, 12),
+        ).pack(side=tk.LEFT, pady=(8, 0))
+
+        actions = tk.Frame(win, bg=COL_BG)
+        actions.pack(fill=tk.X, padx=24, pady=(8, 0))
+
+        def copy_bits() -> None:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(bits)
+            self.root.update()
+            self._status(
+                f"{len(bits):,} bits copiados al portapapeles.",
+                color=COL_OK,
+            )
+
+        RoundedButton(
+            actions, text="Copiar bits", command=copy_bits,
+            bg=COL_RAISED, fg=COL_INK,
+            hover_bg=COL_BORDER_SUBTLE, active_bg=COL_BORDER,
+            parent_bg=COL_BG, padx=14, pady=8,
+        ).pack(side=tk.LEFT)
+
+        tk.Frame(win, bg=COL_BORDER_SUBTLE, height=1).pack(
+            fill=tk.X, padx=24, pady=(14, 0),
+        )
+
+        self._modal_close_footer(win)
+
+        body = tk.Frame(win, bg=COL_BG)
+        body.pack(fill=tk.BOTH, expand=True, padx=24, pady=14)
+        wrap = tk.Frame(body, bg=COL_BORDER, highlightthickness=0)
+        wrap.pack(fill=tk.BOTH, expand=True)
+
+        txt = scrolledtext.ScrolledText(
+            wrap, wrap=tk.CHAR, font=(MONO_FAMILY, 12),
+            bg=COL_SURFACE, fg=COL_INK,
+            relief="flat", borderwidth=0, padx=20, pady=18,
+            spacing1=2, spacing2=6, spacing3=2,
+        )
+        txt.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+        txt.tag_configure("note", foreground=COL_MUTED,
+                          font=(FONT_FAMILY, 10))
+
+        if len(bits) > self._BITS_MODAL_LIMIT:
+            shown = self._format_bit_stream(
+                bits[:self._BITS_MODAL_LIMIT], group=8, per_line=12,
+            )
+            txt.insert("1.0", shown + "\n\n")
+            txt.insert(
+                tk.END,
+                f"... {len(bits) - self._BITS_MODAL_LIMIT:,} bits mas. "
+                "Usa 'Guardar codificado' para el flujo completo.",
+                "note",
+            )
+        else:
+            txt.insert(
+                "1.0",
+                self._format_bit_stream(bits, group=8, per_line=12),
+            )
+        txt.configure(state="disabled")
+
+    # ---- JSON modal (vista expandida de los metadatos) ----
+
+    def _show_json_modal(self) -> None:
+        if not self.encoded_text:
+            messagebox.showinfo(
+                "Sin datos",
+                "Codifica un archivo o pega texto codificado primero.",
+            )
+            return
+
+        meta = self._parse_encoded_meta()
+        if not meta:
+            messagebox.showinfo("Sin metadatos",
+                                "El texto codificado no tiene JSON.")
+            return
+
+        try:
+            payload = self.encoded_text.split("\n", 2)[1]
+            parsed = json.loads(payload)
+            pretty = json.dumps(parsed, indent=2, ensure_ascii=False)
+        except Exception:
+            pretty = self.encoded_text.split("\n", 2)[1] if self.encoded_text else ""
+            parsed = {}
+
+        win = self._modal_window(
+            "Metadatos del codificado · vista expandida",
+            ww=900, wh=660, min_w=720, min_h=520,
+        )
+
+        head = tk.Frame(win, bg=COL_BG)
+        head.pack(fill=tk.X, padx=24, pady=(20, 6))
+        ttk.Label(head, text="METADATOS DEL CODIFICADO",
+                  style="Eyebrow.TLabel").pack(anchor="w")
+
+        sym_row = tk.Frame(head, bg=COL_BG)
+        sym_row.pack(fill=tk.X, pady=(2, 0))
+        tk.Label(
+            sym_row, text="JSON", bg=COL_BG, fg=COL_ACCENT,
+            font=(FONT_FAMILY, 22, "bold"),
+        ).pack(side=tk.LEFT)
+        sub = (
+            f"  {len(parsed.get('frequencies', {}))} simbolos  ·  "
+            f"{int(parsed.get('bit_length', 0)):,} bits  ·  "
+            f"{int(parsed.get('original_size', 0)):,} B originales"
+        )
+        tk.Label(
+            sym_row, text=sub,
+            bg=COL_BG, fg=COL_MUTED, font=(FONT_FAMILY, 11),
+        ).pack(side=tk.LEFT, pady=(8, 0))
+
+        actions = tk.Frame(win, bg=COL_BG)
+        actions.pack(fill=tk.X, padx=24, pady=(8, 0))
+
+        def copy_json() -> None:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(pretty)
+            self.root.update()
+            self._status("Metadatos copiados al portapapeles.", color=COL_OK)
+
+        RoundedButton(
+            actions, text="Copiar JSON", command=copy_json,
+            bg=COL_RAISED, fg=COL_INK,
+            hover_bg=COL_BORDER_SUBTLE, active_bg=COL_BORDER,
+            parent_bg=COL_BG, padx=14, pady=8,
+        ).pack(side=tk.LEFT)
+
+        tk.Frame(win, bg=COL_BORDER_SUBTLE, height=1).pack(
+            fill=tk.X, padx=24, pady=(14, 0),
+        )
+
+        self._modal_close_footer(win)
+
+        body = tk.Frame(win, bg=COL_BG)
+        body.pack(fill=tk.BOTH, expand=True, padx=24, pady=14)
+        wrap = tk.Frame(body, bg=COL_BORDER, highlightthickness=0)
+        wrap.pack(fill=tk.BOTH, expand=True)
+
+        txt = scrolledtext.ScrolledText(
+            wrap, wrap=tk.WORD, font=(MONO_FAMILY, 11),
+            bg=COL_SURFACE, fg=COL_INK,
+            relief="flat", borderwidth=0, padx=20, pady=18,
+        )
+        txt.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+        txt.insert("1.0", pretty)
+        txt.configure(state="disabled")
+
+    # ---- Efficacy modals (TASA, AHORRO, VERIFICACION) ----
+
+    def _show_efficacy_modal(self, key: str) -> None:
+        if not self.encoded_text:
+            messagebox.showinfo(
+                "Sin datos",
+                "Codifica un archivo para ver las metricas de eficacia.",
+            )
+            return
+
+        title, symbol, eyebrow_text = self._EFFICACY_TITLES.get(
+            key, (key, key, key.upper()),
+        )
+
+        win = self._modal_window(
+            f"Calculo · {title}",
+            ww=820, wh=620, min_w=720, min_h=540,
+        )
+
+        head = tk.Frame(win, bg=COL_BG)
+        head.pack(fill=tk.X, padx=24, pady=(20, 8))
+        ttk.Label(head, text=eyebrow_text,
+                  style="Eyebrow.TLabel").pack(anchor="w")
+        sym_row = tk.Frame(head, bg=COL_BG)
+        sym_row.pack(fill=tk.X, pady=(2, 0))
+        tk.Label(
+            sym_row, text=symbol, bg=COL_BG, fg=COL_ACCENT,
+            font=(FONT_FAMILY, 22, "bold"),
+        ).pack(side=tk.LEFT)
+        tk.Label(
+            sym_row, text=f"  {title}", bg=COL_BG, fg=COL_INK,
+            font=(FONT_FAMILY, 18, "bold"),
+        ).pack(side=tk.LEFT)
+
+        tk.Frame(win, bg=COL_BORDER_SUBTLE, height=1).pack(
+            fill=tk.X, padx=24, pady=(12, 0),
+        )
+
+        self._modal_close_footer(win)
+
+        body_wrap = tk.Frame(win, bg=COL_BG)
+        body_wrap.pack(fill=tk.BOTH, expand=True, padx=24, pady=(14, 12))
+
+        text = scrolledtext.ScrolledText(
+            body_wrap, wrap=tk.WORD, font=(MONO_FAMILY, 10),
+            bg=COL_SURFACE, fg=COL_INK,
+            relief="flat", borderwidth=0, padx=18, pady=16,
+            highlightthickness=1, highlightbackground=COL_BORDER,
+        )
+        text.pack(fill=tk.BOTH, expand=True)
+
+        text.tag_configure("eyebrow", foreground=COL_MUTED,
+                           font=(FONT_FAMILY, 8, "bold"),
+                           spacing1=10, spacing3=4)
+        text.tag_configure("formula", foreground=COL_ACCENT,
+                           font=(MONO_FAMILY, 11, "bold"),
+                           spacing1=4, spacing3=8)
+        text.tag_configure("body", foreground=COL_INK,
+                           font=(MONO_FAMILY, 10))
+        text.tag_configure("muted", foreground=COL_MUTED,
+                           font=(MONO_FAMILY, 9))
+        text.tag_configure("accent", foreground=COL_ACCENT,
+                           font=(MONO_FAMILY, 10, "bold"))
+        text.tag_configure("result", foreground=COL_INK,
+                           font=(MONO_FAMILY, 12, "bold"),
+                           spacing1=8, spacing3=8)
+        text.tag_configure("ok", foreground=COL_OK,
+                           font=(MONO_FAMILY, 10, "bold"))
+        text.tag_configure("warn", foreground=COL_WARN,
+                           font=(MONO_FAMILY, 10, "bold"))
+
+        builders = {
+            "compression":  self._calc_text_compression,
+            "savings":      self._calc_text_savings,
+            "verification": self._calc_text_verification,
+        }
+        builder = builders.get(key)
+        if builder:
+            builder(text, self._parse_encoded_meta())
+        text.configure(state="disabled")
+
+    def _calc_text_compression(self, text: tk.Text, meta: dict) -> None:
+        bits = meta.get("bit_length", 0)
+        bytes_orig = meta.get("original_size", 0)
+        bits_orig = bytes_orig * 8
+
+        text.insert(tk.END, "QUE MIDE\n", "eyebrow")
+        text.insert(
+            tk.END,
+            "Que fraccion del archivo original ocupa el bitstream\n"
+            "codificado, medido en bits.\n",
+            "muted",
+        )
+
+        self._write_block(
+            text, eyebrow="FORMULA",
+            formula="T  =  bits_codificados / (bytes_originales × 8) × 100",
+        )
+
+        text.insert(tk.END, "\nDATOS\n", "eyebrow")
+        text.insert(tk.END, f"  bits codificados   = {bits:,}\n", "body")
+        text.insert(tk.END, f"  bytes originales   = {bytes_orig:,}\n", "body")
+        text.insert(
+            tk.END,
+            f"  bits originales    = {bytes_orig:,} × 8 = {bits_orig:,}\n",
+            "body",
+        )
+
+        if bits_orig <= 0:
+            text.insert(tk.END,
+                        "\n  Sin datos suficientes para calcular.\n",
+                        "muted")
+            return
+
+        rate = bits / bits_orig * 100
+        text.insert(tk.END, "\nOPERACION\n", "eyebrow")
+        text.insert(
+            tk.END,
+            f"  T = {bits:,} / {bits_orig:,} × 100\n", "body",
+        )
+        text.insert(tk.END, f"    = {rate:.4f} %\n", "accent")
+
+        text.insert(tk.END, "\nINTERPRETACION\n", "eyebrow")
+        if rate >= 100:
+            interp = ("El codificado ocupa lo mismo o mas que el original. "
+                      "Sin compresion real.")
+        elif rate >= 75:
+            interp = "Compresion modesta. La fuente tiene poca redundancia."
+        elif rate >= 50:
+            interp = ("Compresion clara. El archivo bajo a la mitad o "
+                      "tres cuartos de bits.")
+        else:
+            interp = ("Compresion fuerte. La fuente es muy redundante o "
+                      "muy sesgada hacia pocos simbolos.")
+        text.insert(tk.END, "  " + interp + "\n", "muted")
+
+        text.insert(tk.END, "\nRESULTADO\n", "eyebrow")
+        text.insert(tk.END, f"  T = {rate:.2f} %\n", "result")
+
+    def _calc_text_savings(self, text: tk.Text, meta: dict) -> None:
+        bits = meta.get("bit_length", 0)
+        bytes_orig = meta.get("original_size", 0)
+        bits_orig = bytes_orig * 8
+
+        text.insert(tk.END, "QUE MIDE\n", "eyebrow")
+        text.insert(
+            tk.END,
+            "El complemento de la tasa: cuantos bits del original\n"
+            "desaparecieron al codificar.\n",
+            "muted",
+        )
+
+        self._write_block(
+            text, eyebrow="FORMULA",
+            formula="A  =  100 %  -  T",
+        )
+
+        if bits_orig <= 0:
+            text.insert(tk.END,
+                        "\n  Sin datos suficientes para calcular.\n",
+                        "muted")
+            return
+
+        rate = bits / bits_orig * 100
+        savings = max(0.0, 100 - rate)
+        bits_saved = bits_orig - bits
+
+        text.insert(tk.END, "\nDATOS\n", "eyebrow")
+        text.insert(tk.END, f"  T (tasa)           = {rate:.4f} %\n", "body")
+
+        text.insert(tk.END, "\nOPERACION\n", "eyebrow")
+        text.insert(tk.END, f"  A = 100 - {rate:.4f}\n", "body")
+        text.insert(tk.END, f"    = {savings:.4f} %\n", "accent")
+
+        text.insert(tk.END, "\nEQUIVALENCIA EN BITS\n", "eyebrow")
+        text.insert(
+            tk.END,
+            f"  bits ahorrados = bits_orig - bits_cod\n"
+            f"                 = {bits_orig:,} - {bits:,}\n",
+            "body",
+        )
+        text.insert(tk.END, f"                 = {bits_saved:,} bits\n",
+                    "accent")
+
+        text.insert(tk.END, "\nINTERPRETACION\n", "eyebrow")
+        text.insert(
+            tk.END,
+            "  Mas alto = mejor compresion. El A es la cara visible\n"
+            "  del logro: 'me ahorre Y % de bits'.\n",
+            "muted",
+        )
+
+        text.insert(tk.END, "\nRESULTADO\n", "eyebrow")
+        text.insert(
+            tk.END,
+            f"  A = {savings:.2f} %  ({bits_saved:,} bits eliminados)\n",
+            "result",
+        )
+
+    def _calc_text_verification(self, text: tk.Text, meta: dict) -> None:
+        expected = meta.get("original_size", 0)
+
+        text.insert(tk.END, "QUE COMPRUEBA\n", "eyebrow")
+        text.insert(
+            tk.END,
+            "Que decodificar el bitstream reconstruye exactamente\n"
+            "los bytes del archivo original. El round-trip de Huffman\n"
+            "es lossless por construccion: aqui se confirma con datos.\n",
+            "muted",
+        )
+
+        self._write_block(
+            text, eyebrow="COMO",
+            formula="V  =  len(decoded_bytes) / original_size × 100",
+        )
+
+        text.insert(tk.END, "\nESTADO ACTUAL\n", "eyebrow")
+        if self.decoded_bytes is None:
+            text.insert(
+                tk.END,
+                "  Sin decodificar todavia. Pulsa 'Decodificar'\n"
+                "  para verificar el round-trip.\n",
+                "muted",
+            )
+            text.insert(tk.END,
+                        f"\n  bytes esperados    = {expected:,}\n", "body")
+            text.insert(tk.END,
+                        "  bytes obtenidos    = pendiente\n", "body")
+        else:
+            got = len(self.decoded_bytes)
+            text.insert(tk.END,
+                        f"  bytes esperados    = {expected:,}\n", "body")
+            text.insert(tk.END,
+                        f"  bytes obtenidos    = {got:,}\n", "body")
+            if expected and got == expected:
+                text.insert(
+                    tk.END,
+                    "\n  Round-trip OK: todos los bytes coinciden.\n",
+                    "ok",
+                )
+                text.insert(tk.END, "\nRESULTADO\n", "eyebrow")
+                text.insert(tk.END, "  V = 100.00 %  ✓\n", "result")
+            elif expected:
+                pct = got / expected * 100
+                text.insert(
+                    tk.END,
+                    f"\n  MISMATCH: {got - expected:+d} bytes "
+                    "respecto al esperado.\n",
+                    "warn",
+                )
+                text.insert(tk.END, "\nRESULTADO\n", "eyebrow")
+                text.insert(tk.END, f"  V = {pct:.2f} %\n", "result")
+            else:
+                text.insert(tk.END,
+                            "\n  Sin tamano de referencia en el JSON.\n",
+                            "muted")
+
+        text.insert(tk.END, "\nPOR QUE IMPORTA\n", "eyebrow")
+        text.insert(
+            tk.END,
+            "Huffman es lossless por construccion: la codificacion es\n"
+            "una sustitucion biyectiva entre simbolos y prefijos. Si\n"
+            "esta verificacion baja del 100 %, hay corrupcion en el\n"
+            ".txt (caracteres no binarios, bits cortados, JSON roto)\n"
+            "o un bug en el decoder. No deberia pasar nunca con un\n"
+            "archivo intacto.\n",
+            "muted",
+        )
+
+    # ------------------------------------------------------------------
     # Acciones
     # ------------------------------------------------------------------
 
@@ -2332,13 +3339,14 @@ class App:
             return
         self.loaded_bytes = data
         self.loaded_path = p
+        self.encoded_source_path = None
         self.encoded_text = None
         self.decoded_bytes = None
         self.info_var.set(
             f"{p.name}  ·  {len(data):,} bytes  ·  {p.suffix or 'sin extension'}"
         )
         self.log_text.delete("1.0", tk.END)
-        self.out_text.delete("1.0", tk.END)
+        self._clear_output_panels()
         self._reset_steps()
         self.current_root = None
         self.current_codes = None
@@ -2346,8 +3354,9 @@ class App:
         self.current_metrics = None
         self.last_action_label = f"Original cargado · {p.name}"
         self._draw_tree_placeholder()
-        self._update_metrics(input=f"{len(data):,} B", symbols="—",
-                             bits="—", output="—", ratio="—")
+        self._update_metrics(input=f"{len(data):,} B", symbols=EMPTY_VALUE,
+                             bits=EMPTY_VALUE, output=EMPTY_VALUE,
+                             ratio=EMPTY_VALUE)
         self.log(f"Archivo cargado: {p}")
         self.log(f"Tamano: {len(data)} bytes")
         self._set_preview(data)
@@ -2362,7 +3371,7 @@ class App:
             )
             return
         self.log_text.delete("1.0", tk.END)
-        self.out_text.delete("1.0", tk.END)
+        self._clear_output_panels()
         self._reset_steps()
         self.root.config(cursor="watch")
         self.root.update_idletasks()
@@ -2420,6 +3429,8 @@ class App:
             messagebox.showerror("Error al leer", str(e))
             return
         self.encoded_text = text
+        self.encoded_source_path = Path(path)
+        self.loaded_path = None
         self.loaded_bytes = None
         self.decoded_bytes = None
         self._set_output(text)
@@ -2433,25 +3444,12 @@ class App:
                      color=COL_OK)
 
     def do_decode(self) -> None:
-        pasted = self.out_text.get("1.0", tk.END).strip()
-        panel_is_preview = (
-            self.encoded_text is not None
-            and "... (mostrando los primeros" in pasted
-        )
-
-        if self.encoded_text and panel_is_preview:
-            text = self.encoded_text
-        elif pasted.startswith(FORMAT_HEADER):
-            text = pasted
-        elif self.encoded_text:
-            text = self.encoded_text
-        else:
-            text = pasted
-
+        text = (self.encoded_text or "").strip()
         if not text:
             messagebox.showwarning(
                 "Nada que decodificar",
-                "Carga o pega un texto codificado primero.",
+                "Carga un .txt codificado o pulsa "
+                "'Pegar texto crudo' en la pestana Resultado.",
             )
             return
         self.log_text.delete("1.0", tk.END)
@@ -2467,13 +3465,14 @@ class App:
         finally:
             self.root.config(cursor="")
         self.decoded_bytes = data
+        self._update_verification()
         self._set_preview(data)
         self._update_metrics(
             input=f"{len(text):,} ch",
             symbols=str(len(self.current_freqs or {})),
-            bits="—",
+            bits=EMPTY_VALUE,
             output=f"{len(data):,} B",
-            ratio="—",
+            ratio=EMPTY_VALUE,
         )
 
         self.current_metrics = _calculate_metrics(
@@ -2499,7 +3498,10 @@ class App:
                 "Primero codifica un archivo.",
             )
             return
-        default = "media-codificada.txt"
+        if self.loaded_path is not None:
+            default = f"coded-{self.loaded_path.stem}.txt"
+        else:
+            default = "coded-media.txt"
         path = filedialog.asksaveasfilename(
             title="Guardar resultado codificado",
             defaultextension=".txt",
@@ -2516,6 +3518,85 @@ class App:
         self._status(f"Guardado: {path}", color=COL_OK)
         messagebox.showinfo("Guardado", f"Archivo guardado en:\n{path}")
 
+    @staticmethod
+    def _sniff_extension(data: bytes) -> str:
+        """Inspecciona magic bytes y devuelve la extension probable.
+
+        Cobertura: imagen comun (png/jpg/gif/bmp/webp/tiff), audio
+        (wav/mp3/flac/ogg/m4a), video (mp4/webm), texto/PDF. Devuelve
+        cadena vacia si no reconoce el formato.
+        """
+        if not data:
+            return ""
+        if data.startswith(b"\x89PNG\r\n\x1a\n"):
+            return ".png"
+        if data.startswith(b"\xff\xd8\xff"):
+            return ".jpg"
+        if data.startswith((b"GIF87a", b"GIF89a")):
+            return ".gif"
+        if data.startswith(b"BM"):
+            return ".bmp"
+        if data.startswith(b"RIFF") and len(data) >= 12:
+            container = data[8:12]
+            if container == b"WAVE":
+                return ".wav"
+            if container == b"WEBP":
+                return ".webp"
+            if container == b"AVI ":
+                return ".avi"
+        if data.startswith(b"ID3") or data[:2] == b"\xff\xfb":
+            return ".mp3"
+        if data.startswith(b"fLaC"):
+            return ".flac"
+        if data.startswith(b"OggS"):
+            return ".ogg"
+        if data[:4] in (b"II*\x00", b"MM\x00*"):
+            return ".tif"
+        if data.startswith(b"%PDF-"):
+            return ".pdf"
+        if len(data) >= 12 and data[4:8] == b"ftyp":
+            brand = data[8:12]
+            if brand in (b"isom", b"mp42", b"avc1", b"mp41",
+                         b"iso2", b"M4V "):
+                return ".mp4"
+            if brand in (b"M4A ", b"M4B "):
+                return ".m4a"
+        if len(data) >= 4 and data[:4] == b"\x1aE\xdf\xa3":
+            return ".webm"
+        # Texto plano: si todos los bytes son ASCII imprimibles + espacios
+        sample = data[:512]
+        if sample and all(b == 9 or b == 10 or b == 13 or 32 <= b < 127
+                          for b in sample):
+            return ".txt"
+        return ""
+
+    @staticmethod
+    def _suggest_decoded_name(loaded_path,
+                              encoded_source_path,
+                              decoded_bytes: bytes | None) -> tuple[str, str]:
+        """Devuelve (nombre_por_defecto, extension) para 'Restaurar media'.
+
+        Prioridad:
+          1. loaded_path: usa stem y suffix (caso estandar).
+          2. encoded_source_path 'coded-xyz.txt': recupera stem 'xyz', y la
+             extension se olfatea de los bytes decodificados.
+          3. Generico 'media' + olfateo de extension.
+        """
+        if loaded_path is not None:
+            stem = loaded_path.stem
+            ext = loaded_path.suffix
+        else:
+            if encoded_source_path is not None:
+                enc_stem = encoded_source_path.stem
+                if enc_stem.startswith("coded-"):
+                    stem = enc_stem[len("coded-"):] or "media"
+                else:
+                    stem = enc_stem
+            else:
+                stem = "media"
+            ext = App._sniff_extension(decoded_bytes or b"")
+        return f"restored-{stem}{ext}", ext
+
     def save_decoded(self) -> None:
         if self.decoded_bytes is None:
             messagebox.showwarning(
@@ -2523,9 +3604,27 @@ class App:
                 "Primero decodifica un texto codificado.",
             )
             return
+
+        default, ext = self._suggest_decoded_name(
+            self.loaded_path,
+            self.encoded_source_path,
+            self.decoded_bytes,
+        )
+
+        if ext:
+            ext_label = ext.lstrip(".").upper()
+            filetypes = [
+                (f"{ext_label} ({ext})", f"*{ext}"),
+                ("Todos", "*.*"),
+            ]
+        else:
+            filetypes = [("Todos", "*.*")]
+
         path = filedialog.asksaveasfilename(
             title="Guardar media decodificada",
-            filetypes=[("Todos", "*.*")],
+            defaultextension=ext or "",
+            initialfile=default,
+            filetypes=filetypes,
         )
         if not path:
             return
@@ -2555,6 +3654,7 @@ class App:
     def clear(self) -> None:
         self.loaded_bytes = None
         self.loaded_path = None
+        self.encoded_source_path = None
         self.encoded_text = None
         self.decoded_bytes = None
         self.current_root = None
@@ -2563,11 +3663,12 @@ class App:
         self.current_metrics = None
         self.last_action_label = "sin operacion"
         self.log_text.delete("1.0", tk.END)
-        self.out_text.delete("1.0", tk.END)
+        self._clear_output_panels()
         self.info_var.set("Sin archivo cargado.")
         self._reset_steps()
-        self._update_metrics(input="—", symbols="—", bits="—",
-                             output="—", ratio="—")
+        self._update_metrics(input=EMPTY_VALUE, symbols=EMPTY_VALUE,
+                             bits=EMPTY_VALUE, output=EMPTY_VALUE,
+                             ratio=EMPTY_VALUE)
         self._draw_tree_placeholder()
         self._set_preview(None)
         self._refresh_analysis()
