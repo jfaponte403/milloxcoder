@@ -1,7 +1,15 @@
 # Tkinter viene incluido en Python en Windows/macOS.
 # En Linux: sudo apt install python3-tk (o equivalente).
-# Pillow se usa para exportar el arbol de Huffman a PNG/JPEG.
+# Pillow se usa para exportar el arbol de Huffman a PNG/JPEG y
+# previsualizar imagenes / fotogramas de video / paginas de PDF.
 Pillow>=10.0
+
+# Reproduccion y previsualizacion en la pestana 'Vista previa'.
+# Cualquiera de las tres es opcional: si falta, la previsualizacion
+# se degrada a la representacion estatica del formato.
+pymupdf>=1.23      # PDF: render de paginas
+pygame-ce>=2.5     # Audio: reproduccion mp3/wav/ogg/flac
+opencv-python>=4.8 # Video: lectura de fotogramas
 
 # Pytest para la suite de tests en tests/.
 pytest>=8.0

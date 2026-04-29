@@ -6,6 +6,8 @@ from __future__ import annotations
 import io
 import json
 import math
+import shutil
+import tempfile
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, font as tkfont, messagebox, scrolledtext, ttk
@@ -47,7 +49,12 @@ MONO_FAMILY = "Consolas"
 # Constantes
 # ---------------------------------------------------------------------------
 
-MEDIA_EXTENSIONS = ".png .jpg .jpeg .gif .bmp .tiff .webp .wav .mp3 .ogg .flac .m4a .aac"
+MEDIA_EXTENSIONS = (
+    ".png .jpg .jpeg .gif .bmp .tiff .webp "
+    ".wav .mp3 .ogg .flac .m4a .aac "
+    ".mp4 .webm .avi .mov "
+    ".pdf .txt"
+)
 DISPLAY_LIMIT = 60_000
 
 # Glifo neutro para metricas sin valor todavia. Middle dot, no em dash:
@@ -327,8 +334,25 @@ class App:
         self.current_metrics: dict | None = None
         self.last_action_label: str = "sin operacion"
 
+        # Estado de reproduccion de la pestana 'Vista previa'.
+        self._media_temp_dir: Path | None = None
+        self._audio_initialized: bool = False
+        self._audio_temp_path: Path | None = None
+        self._audio_paused: bool = False
+        self._video_cap = None
+        self._video_after_id: str | None = None
+        self._video_temp_path: Path | None = None
+        self._video_frame_delay: int = 33
+        self._video_playing: bool = False
+        self._video_photo = None
+        self._pdf_doc = None
+        self._pdf_page_idx: int = 0
+        self._pdf_total_pages: int = 0
+        self._pdf_label_var: tk.StringVar | None = None
+
         self._configure_style()
         self._build_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ------------------------------------------------------------------
     # Window
@@ -1638,7 +1662,7 @@ class App:
                   style="Eyebrow.TLabel").pack(side=tk.LEFT, pady=(8, 0))
         ttk.Label(
             top,
-            text="Imagen reconstruida desde los bytes (originales o decodificados).",
+            text="Representacion del archivo segun su formato (originales o decodificados).",
             style="Subhead.TLabel",
         ).pack(side=tk.LEFT, padx=(12, 0), pady=(8, 0))
 
@@ -1655,10 +1679,13 @@ class App:
         self.preview_canvas.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
         self.preview_canvas.bind("<Configure>", lambda e: self._refresh_preview())
 
+        self.preview_controls = tk.Frame(inner, bg=COL_BG)
+        self.preview_controls.pack(fill=tk.X, pady=(10, 0))
+
         self._preview_source: bytes | None = None
         self._preview_photo = None
         self._draw_preview_placeholder(
-            "Carga una imagen, o codifica/decodifica una, para verla aqui."
+            "Carga un archivo, o codifica/decodifica uno, para verlo aqui."
         )
 
     # ------------------------------------------------------------------
@@ -2130,16 +2157,141 @@ class App:
 
     def _set_preview(self, data: bytes | None) -> None:
         self._preview_source = data
+        self._stop_media_playback()
+        self._clear_preview_controls()
         self._refresh_preview()
 
     def _refresh_preview(self) -> None:
         data = self._preview_source
         if not data:
             self._draw_preview_placeholder(
-                "Carga una imagen, o codifica/decodifica una, para verla aqui."
+                "Carga un archivo, o codifica/decodifica uno, para verlo aqui."
             )
             return
 
+        # En un evento de resize, los motores activos siguen vivos y solo
+        # redibujamos lo necesario sin reiniciar la reproduccion.
+        if self._video_cap is not None:
+            return  # el bucle de fotogramas reescala con el nuevo tamano
+        if self._pdf_doc is not None:
+            self._render_pdf_page(len(data))
+            return
+        if self._audio_temp_path is not None:
+            ext_active = self._audio_temp_path.suffix or ".mp3"
+            self._draw_audio_visual(data, ext_active)
+            return
+
+        ext = self._sniff_extension(data)
+
+        if ext in (".png", ".jpg", ".gif", ".bmp", ".webp", ".tif"):
+            self._draw_image_preview(data, ext)
+        elif ext == ".pdf":
+            self._draw_pdf_preview(data)
+        elif ext in (".mp3", ".wav", ".flac", ".ogg", ".m4a"):
+            self._draw_audio_preview(data, ext)
+        elif ext in (".mp4", ".webm", ".avi"):
+            self._draw_video_preview(data, ext)
+        elif ext == ".txt":
+            self._draw_text_preview(data)
+        else:
+            self._draw_binary_preview(data)
+
+    # ------------------------------------------------------------------
+    # Reproduccion de medios: utilidades comunes
+    # ------------------------------------------------------------------
+
+    def _media_temp_dir_path(self) -> Path:
+        if self._media_temp_dir is None:
+            self._media_temp_dir = Path(tempfile.mkdtemp(prefix="milloxcoder_"))
+        return self._media_temp_dir
+
+    def _write_media_temp(self, data: bytes, ext: str) -> Path:
+        path = self._media_temp_dir_path() / f"preview{ext}"
+        path.write_bytes(data)
+        return path
+
+    def _clear_preview_controls(self) -> None:
+        for child in self.preview_controls.winfo_children():
+            child.destroy()
+
+    def _stop_media_playback(self) -> None:
+        # Audio
+        if self._audio_initialized:
+            try:
+                import pygame
+                pygame.mixer.music.stop()
+                pygame.mixer.music.unload()
+            except Exception:
+                pass
+        self._audio_paused = False
+        self._audio_temp_path = None
+
+        # Video
+        if self._video_after_id is not None:
+            try:
+                self.root.after_cancel(self._video_after_id)
+            except Exception:
+                pass
+            self._video_after_id = None
+        if self._video_cap is not None:
+            try:
+                self._video_cap.release()
+            except Exception:
+                pass
+            self._video_cap = None
+        self._video_playing = False
+        self._video_photo = None
+        self._video_temp_path = None
+
+        # PDF
+        if self._pdf_doc is not None:
+            try:
+                self._pdf_doc.close()
+            except Exception:
+                pass
+            self._pdf_doc = None
+        self._pdf_page_idx = 0
+        self._pdf_total_pages = 0
+        self._pdf_label_var = None
+
+    def _on_close(self) -> None:
+        self._stop_media_playback()
+        if self._audio_initialized:
+            try:
+                import pygame
+                pygame.mixer.quit()
+            except Exception:
+                pass
+            self._audio_initialized = False
+        if self._media_temp_dir is not None:
+            shutil.rmtree(self._media_temp_dir, ignore_errors=True)
+            self._media_temp_dir = None
+        self.root.destroy()
+
+    def _preview_canvas_dims(self) -> tuple[tk.Canvas, int, int]:
+        c = self.preview_canvas
+        c.delete("all")
+        c.update_idletasks()
+        return c, max(c.winfo_width(), 1), max(c.winfo_height(), 1)
+
+    def _draw_format_chip(self, c: tk.Canvas, x: float, y: float,
+                          label: str) -> None:
+        text_id = c.create_text(
+            x, y, text=label, fill=COL_ACCENT_ACTIVE,
+            font=(FONT_FAMILY, 9, "bold"), anchor="center",
+        )
+        bbox = c.bbox(text_id)
+        if not bbox:
+            return
+        pad_x, pad_y = 12, 5
+        rect = c.create_rectangle(
+            bbox[0] - pad_x, bbox[1] - pad_y,
+            bbox[2] + pad_x, bbox[3] + pad_y,
+            fill=COL_ACCENT_SOFT, outline="",
+        )
+        c.tag_raise(text_id, rect)
+
+    def _draw_image_preview(self, data: bytes, ext: str) -> None:
         try:
             from PIL import Image, ImageTk
         except ImportError:
@@ -2152,18 +2304,10 @@ class App:
             img = Image.open(io.BytesIO(data))
             img.load()
         except Exception:
-            self._draw_preview_placeholder(
-                f"Los {len(data):,} bytes no son una imagen reconocible.\n"
-                "Si cargaste audio u otro tipo de archivo, esto es normal."
-            )
+            self._draw_binary_preview(data)
             return
 
-        c = self.preview_canvas
-        c.delete("all")
-        c.update_idletasks()
-        cw = max(c.winfo_width(), 1)
-        ch = max(c.winfo_height(), 1)
-
+        c, cw, ch = self._preview_canvas_dims()
         iw, ih = img.size
         scale = min((cw - 24) / iw, (ch - 24) / ih, 1.0)
         if scale < 1.0:
@@ -2177,6 +2321,525 @@ class App:
         self.preview_info.set(
             f"{img.format or '?'}  ·  {iw}×{ih} px  ·  {len(data):,} bytes"
         )
+
+    def _draw_audio_preview(self, data: bytes, ext: str) -> None:
+        self._draw_audio_visual(data, ext)
+        self._build_audio_controls(data, ext)
+        self.preview_info.set(
+            f"Audio  ·  {ext.lstrip('.').upper()}  ·  {len(data):,} bytes"
+        )
+
+    def _draw_audio_visual(self, data: bytes, ext: str) -> None:
+        c, cw, ch = self._preview_canvas_dims()
+        kind = ext.lstrip(".").upper()
+        self._draw_format_chip(c, cw / 2, 28, f"AUDIO · {kind}")
+
+        n = len(data)
+        margin_x = max(56, int(cw * 0.10))
+        plot_w = max(120, cw - 2 * margin_x)
+        plot_h = max(60, int(ch * 0.42))
+        cy = ch / 2 + 8
+
+        bar_w = 3
+        gap = 2
+        n_bars = max(20, plot_w // (bar_w + gap))
+
+        skip = min(2048, n // 16) if n > 4096 else 0
+        body = data[skip:] if (n - skip) > n_bars * 4 else data
+        step = max(1, len(body) // max(1, n_bars))
+
+        total_w = n_bars * (bar_w + gap) - gap
+        x = (cw - total_w) / 2
+        for i in range(n_bars):
+            idx = i * step
+            sample = body[idx] if idx < len(body) else 128
+            amp = abs(sample - 128) / 128.0
+            h = max(3, int(amp * plot_h))
+            color = COL_ACCENT if i % 9 == 0 else COL_INK
+            c.create_rectangle(
+                x, cy - h / 2, x + bar_w, cy + h / 2,
+                fill=color, outline="",
+            )
+            x += bar_w + gap
+
+        c.create_line(
+            margin_x, cy + plot_h / 2 + 18,
+            cw - margin_x, cy + plot_h / 2 + 18,
+            fill=COL_BORDER, width=1,
+        )
+
+    def _build_audio_controls(self, data: bytes, ext: str) -> None:
+        self._clear_preview_controls()
+        bar = self.preview_controls
+
+        try:
+            import pygame  # noqa: F401
+            playable = True
+            note = ""
+        except ImportError:
+            playable = False
+            note = "Instala 'pygame-ce' para reproducir el audio aqui."
+
+        if not playable:
+            ttk.Label(bar, text=note, style="Muted.TLabel").pack(side=tk.LEFT)
+            return
+
+        try:
+            self._audio_temp_path = self._write_media_temp(data, ext)
+        except OSError as e:
+            ttk.Label(
+                bar, text=f"No se pudo preparar el audio: {e}",
+                style="Muted.TLabel",
+            ).pack(side=tk.LEFT)
+            return
+
+        RoundedButton(
+            bar, "Reproducir", command=self._audio_play,
+            bg=COL_ACCENT, fg="#FFFFFF",
+            hover_bg=COL_ACCENT_HOVER, active_bg=COL_ACCENT_ACTIVE,
+            parent_bg=COL_BG, padx=14, pady=8, bold=True,
+        ).pack(side=tk.LEFT)
+        RoundedButton(
+            bar, "Pausa", command=self._audio_toggle_pause,
+            bg=COL_RAISED, fg=COL_INK,
+            hover_bg=COL_BORDER_SUBTLE, active_bg=COL_BORDER,
+            parent_bg=COL_BG, padx=14, pady=8,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        RoundedButton(
+            bar, "Detener", command=self._audio_stop,
+            bg=COL_RAISED, fg=COL_INK,
+            hover_bg=COL_BORDER_SUBTLE, active_bg=COL_BORDER,
+            parent_bg=COL_BG, padx=14, pady=8,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+
+    def _ensure_audio_engine(self) -> bool:
+        try:
+            import pygame
+        except ImportError:
+            return False
+        if not self._audio_initialized:
+            try:
+                pygame.mixer.init()
+            except Exception as e:
+                messagebox.showerror(
+                    "Audio no disponible",
+                    f"No se pudo inicializar pygame.mixer: {e}",
+                )
+                return False
+            self._audio_initialized = True
+        return True
+
+    def _audio_play(self) -> None:
+        if self._audio_temp_path is None:
+            return
+        if not self._ensure_audio_engine():
+            return
+        import pygame
+        try:
+            pygame.mixer.music.load(str(self._audio_temp_path))
+            pygame.mixer.music.play()
+            self._audio_paused = False
+        except pygame.error as e:
+            messagebox.showerror(
+                "Reproduccion fallida",
+                f"pygame no pudo decodificar el audio: {e}",
+            )
+
+    def _audio_toggle_pause(self) -> None:
+        if not self._audio_initialized:
+            return
+        import pygame
+        if self._audio_paused:
+            pygame.mixer.music.unpause()
+            self._audio_paused = False
+        else:
+            pygame.mixer.music.pause()
+            self._audio_paused = True
+
+    def _audio_stop(self) -> None:
+        if not self._audio_initialized:
+            return
+        import pygame
+        pygame.mixer.music.stop()
+        self._audio_paused = False
+
+    def _draw_video_preview(self, data: bytes, ext: str) -> None:
+        kind = ext.lstrip(".").upper()
+        try:
+            import cv2  # noqa: F401
+        except ImportError:
+            self._draw_video_static(data, ext, reason=(
+                "Instala 'opencv-python' para reproducir el video aqui."
+            ))
+            return
+
+        try:
+            self._video_temp_path = self._write_media_temp(data, ext)
+        except OSError as e:
+            self._draw_video_static(data, ext, reason=f"No se pudo preparar el video: {e}")
+            return
+
+        import cv2
+        cap = cv2.VideoCapture(str(self._video_temp_path))
+        if not cap.isOpened():
+            cap.release()
+            self._draw_video_static(
+                data, ext,
+                reason="OpenCV no pudo abrir el video (codec no soportado).",
+            )
+            return
+
+        self._video_cap = cap
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        self._video_frame_delay = max(15, int(1000 / fps))
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+
+        c, cw, ch = self._preview_canvas_dims()
+        self._draw_format_chip(c, cw / 2, 28, f"VIDEO · {kind}")
+        self._show_video_frame(initial=True)
+
+        self._build_video_controls()
+        info_extra = f"  ·  {total} frames" if total else ""
+        self.preview_info.set(
+            f"Video  ·  {kind}  ·  {fps:.0f} fps{info_extra}  ·  {len(data):,} bytes"
+        )
+
+    def _build_video_controls(self) -> None:
+        self._clear_preview_controls()
+        bar = self.preview_controls
+
+        RoundedButton(
+            bar, "Reproducir", command=self._video_play,
+            bg=COL_ACCENT, fg="#FFFFFF",
+            hover_bg=COL_ACCENT_HOVER, active_bg=COL_ACCENT_ACTIVE,
+            parent_bg=COL_BG, padx=14, pady=8, bold=True,
+        ).pack(side=tk.LEFT)
+        RoundedButton(
+            bar, "Pausa", command=self._video_pause,
+            bg=COL_RAISED, fg=COL_INK,
+            hover_bg=COL_BORDER_SUBTLE, active_bg=COL_BORDER,
+            parent_bg=COL_BG, padx=14, pady=8,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        RoundedButton(
+            bar, "Detener", command=self._video_stop,
+            bg=COL_RAISED, fg=COL_INK,
+            hover_bg=COL_BORDER_SUBTLE, active_bg=COL_BORDER,
+            parent_bg=COL_BG, padx=14, pady=8,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+
+    def _show_video_frame(self, initial: bool = False) -> None:
+        if self._video_cap is None:
+            return
+        try:
+            from PIL import Image, ImageTk
+        except ImportError:
+            return
+        import cv2
+
+        ret, frame = self._video_cap.read()
+        if not ret:
+            self._video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret, frame = self._video_cap.read()
+            if not ret:
+                self._video_pause()
+                return
+
+        c = self.preview_canvas
+        cw = max(c.winfo_width(), 1)
+        ch = max(c.winfo_height(), 1)
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        ih, iw = rgb.shape[:2]
+        scale = min((cw - 32) / iw, (ch - 80) / ih, 1.0)
+        if scale < 1.0:
+            new_w = max(1, int(iw * scale))
+            new_h = max(1, int(ih * scale))
+            rgb = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+        img = Image.fromarray(rgb)
+        self._video_photo = ImageTk.PhotoImage(img)
+
+        c.delete("video_frame")
+        c.create_image(cw / 2, ch / 2 + 8, image=self._video_photo,
+                       anchor="center", tags="video_frame")
+
+        if self._video_playing and not initial:
+            self._video_after_id = self.root.after(
+                self._video_frame_delay, self._show_video_frame
+            )
+
+    def _video_play(self) -> None:
+        if self._video_cap is None or self._video_playing:
+            return
+        self._video_playing = True
+        self._video_after_id = self.root.after(
+            self._video_frame_delay, self._show_video_frame
+        )
+
+    def _video_pause(self) -> None:
+        self._video_playing = False
+        if self._video_after_id is not None:
+            try:
+                self.root.after_cancel(self._video_after_id)
+            except Exception:
+                pass
+            self._video_after_id = None
+
+    def _video_stop(self) -> None:
+        self._video_pause()
+        if self._video_cap is None:
+            return
+        import cv2
+        self._video_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        self._show_video_frame(initial=True)
+
+    def _draw_video_static(self, data: bytes, ext: str,
+                           reason: str = "") -> None:
+        c, cw, ch = self._preview_canvas_dims()
+        self._clear_preview_controls()
+        kind = ext.lstrip(".").upper()
+        self._draw_format_chip(c, cw / 2, 28, f"VIDEO · {kind}")
+
+        strip_h = max(120, min(int(ch * 0.42), 200))
+        strip_w = min(cw - 80, 560)
+        sx = (cw - strip_w) / 2
+        sy = ch / 2 - strip_h / 2 + 4
+        band = 16
+
+        c.create_rectangle(sx, sy, sx + strip_w, sy + band,
+                           fill=COL_INK, outline="")
+        c.create_rectangle(sx, sy + strip_h - band, sx + strip_w,
+                           sy + strip_h, fill=COL_INK, outline="")
+
+        holes = 9
+        hole_w = 18
+        gap_h = (strip_w - holes * hole_w) / (holes + 1)
+        for i in range(holes):
+            hx = sx + gap_h + i * (hole_w + gap_h)
+            c.create_rectangle(hx, sy + 4, hx + hole_w, sy + band - 4,
+                               fill=COL_BG, outline="")
+            c.create_rectangle(hx, sy + strip_h - band + 4,
+                               hx + hole_w, sy + strip_h - 4,
+                               fill=COL_BG, outline="")
+
+        frames = 3
+        inner_top = sy + band + 8
+        inner_bot = sy + strip_h - band - 8
+        inner_h = inner_bot - inner_top
+        pad = 12
+        frame_w = (strip_w - pad * (frames + 1)) / frames
+        for i in range(frames):
+            fx = sx + pad + i * (frame_w + pad)
+            c.create_rectangle(fx, inner_top, fx + frame_w, inner_bot,
+                               fill=COL_RAISED, outline=COL_BORDER, width=1)
+            cx = fx + frame_w / 2
+            cyf = inner_top + inner_h / 2
+            r = min(frame_w, inner_h) * 0.18
+            c.create_polygon(
+                cx - r * 0.7, cyf - r,
+                cx - r * 0.7, cyf + r,
+                cx + r, cyf,
+                fill=COL_ACCENT, outline="",
+            )
+
+        if reason:
+            c.create_text(
+                cw / 2, ch - 26, text=reason,
+                fill=COL_MUTED, font=(FONT_FAMILY, 9), width=cw - 80,
+            )
+        self.preview_info.set(f"Video  ·  {kind}  ·  {len(data):,} bytes")
+
+    def _draw_pdf_preview(self, data: bytes) -> None:
+        try:
+            import fitz  # PyMuPDF
+        except ImportError:
+            self._draw_pdf_static(data, reason=(
+                "Instala 'pymupdf' para renderizar paginas reales (pip install pymupdf)."
+            ))
+            return
+
+        try:
+            self._pdf_doc = fitz.open(stream=data, filetype="pdf")
+        except Exception as e:
+            self._draw_pdf_static(
+                data, reason=f"PDF no decodificable: {e}"
+            )
+            return
+
+        self._pdf_total_pages = self._pdf_doc.page_count
+        self._pdf_page_idx = 0
+        self._clear_preview_controls()
+        self._pdf_label_var = tk.StringVar(value="")
+        self._build_pdf_controls()
+        self._render_pdf_page(len(data))
+
+    def _build_pdf_controls(self) -> None:
+        bar = self.preview_controls
+        RoundedButton(
+            bar, "<- Anterior",
+            command=lambda: self._pdf_step(-1),
+            bg=COL_RAISED, fg=COL_INK,
+            hover_bg=COL_BORDER_SUBTLE, active_bg=COL_BORDER,
+            parent_bg=COL_BG, padx=14, pady=8,
+        ).pack(side=tk.LEFT)
+        RoundedButton(
+            bar, "Siguiente ->",
+            command=lambda: self._pdf_step(1),
+            bg=COL_RAISED, fg=COL_INK,
+            hover_bg=COL_BORDER_SUBTLE, active_bg=COL_BORDER,
+            parent_bg=COL_BG, padx=14, pady=8,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(bar, textvariable=self._pdf_label_var,
+                  style="Muted.TLabel").pack(side=tk.LEFT, padx=(16, 0))
+
+    def _pdf_step(self, delta: int) -> None:
+        if self._pdf_doc is None or self._pdf_total_pages == 0:
+            return
+        self._pdf_page_idx = max(
+            0, min(self._pdf_total_pages - 1, self._pdf_page_idx + delta)
+        )
+        self._render_pdf_page(len(self._preview_source or b""))
+
+    def _render_pdf_page(self, byte_size: int) -> None:
+        if self._pdf_doc is None:
+            return
+        try:
+            from PIL import Image, ImageTk
+        except ImportError:
+            self._draw_pdf_static(self._preview_source or b"", reason=(
+                "Instala Pillow para renderizar las paginas."
+            ))
+            return
+
+        c, cw, ch = self._preview_canvas_dims()
+        self._draw_format_chip(c, cw / 2, 28, "PDF")
+
+        page = self._pdf_doc[self._pdf_page_idx]
+        page_rect = page.rect
+        target_w = max(60, cw - 80)
+        target_h = max(60, ch - 100)
+        scale = min(target_w / max(page_rect.width, 1),
+                    target_h / max(page_rect.height, 1))
+        scale = max(scale, 0.25)
+
+        import fitz
+        pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+        self._preview_photo = ImageTk.PhotoImage(img)
+        c.create_image(cw / 2, ch / 2 + 8, image=self._preview_photo,
+                       anchor="center")
+
+        if self._pdf_label_var is not None:
+            self._pdf_label_var.set(
+                f"Pag. {self._pdf_page_idx + 1} / {self._pdf_total_pages}"
+            )
+        version = self._pdf_doc.metadata.get("format", "PDF")
+        self.preview_info.set(
+            f"{version}  ·  {self._pdf_total_pages} pag.  ·  {byte_size:,} bytes"
+        )
+
+    def _draw_pdf_static(self, data: bytes, reason: str = "") -> None:
+        c, cw, ch = self._preview_canvas_dims()
+        self._clear_preview_controls()
+        self._draw_format_chip(c, cw / 2, 28, "PDF")
+
+        doc_w = min(cw - 140, 220)
+        doc_h = min(ch - 140, 280)
+        if doc_w < 100 or doc_h < 120:
+            doc_w, doc_h = 160, 200
+        dx = cw / 2 - doc_w / 2
+        dy = ch / 2 - doc_h / 2 + 8
+        fold = 32
+
+        c.create_polygon(
+            dx, dy,
+            dx + doc_w - fold, dy,
+            dx + doc_w, dy + fold,
+            dx + doc_w, dy + doc_h,
+            dx, dy + doc_h,
+            fill=COL_SURFACE, outline=COL_INK, width=2,
+        )
+        c.create_polygon(
+            dx + doc_w - fold, dy,
+            dx + doc_w, dy + fold,
+            dx + doc_w - fold, dy + fold,
+            fill=COL_RAISED, outline=COL_INK, width=2,
+        )
+
+        line_y = dy + fold + 22
+        line_idx = 0
+        while line_y < dy + doc_h - 20:
+            line_w = doc_w - 36
+            if line_idx % 4 == 3:
+                line_w *= 0.55
+            c.create_rectangle(
+                dx + 18, line_y, dx + 18 + line_w, line_y + 5,
+                fill=COL_BORDER, outline="",
+            )
+            line_y += 14
+            line_idx += 1
+
+        if reason:
+            c.create_text(
+                cw / 2, ch - 28, text=reason,
+                fill=COL_MUTED, font=(FONT_FAMILY, 9), width=cw - 80,
+            )
+        self.preview_info.set(f"PDF  ·  {len(data):,} bytes")
+
+    def _draw_text_preview(self, data: bytes) -> None:
+        c, cw, ch = self._preview_canvas_dims()
+        self._draw_format_chip(c, cw / 2, 28, "TEXTO")
+
+        try:
+            text = data.decode("utf-8")
+            encoding = "UTF-8"
+        except UnicodeDecodeError:
+            text = data.decode("latin-1", errors="replace")
+            encoding = "Latin-1"
+
+        snippet = text[:3000]
+        if len(text) > 3000:
+            snippet = snippet.rstrip() + "\n\n..."
+
+        margin = 32
+        c.create_text(
+            margin, 60,
+            text=snippet, fill=COL_INK,
+            font=(MONO_FAMILY, 9), anchor="nw",
+            width=cw - margin * 2,
+        )
+
+        lines = text.count("\n") + (0 if text.endswith("\n") else 1)
+        self.preview_info.set(
+            f"Texto  ·  {encoding}  ·  {lines:,} lineas  ·  {len(data):,} bytes"
+        )
+
+    def _draw_binary_preview(self, data: bytes) -> None:
+        c, cw, ch = self._preview_canvas_dims()
+        self._draw_format_chip(c, cw / 2, 28, "BINARIO")
+
+        sample = data[:128]
+        rows = []
+        for i in range(0, len(sample), 16):
+            chunk = sample[i:i + 16]
+            hex_part = " ".join(f"{b:02x}" for b in chunk)
+            ascii_part = "".join(
+                chr(b) if 32 <= b < 127 else "·" for b in chunk
+            )
+            rows.append(f"{i:04x}  {hex_part:<47}  {ascii_part}")
+
+        body = "\n".join(rows) if rows else "(vacio)"
+        c.create_text(
+            cw / 2, ch / 2,
+            text=body, fill=COL_INK,
+            font=(MONO_FAMILY, 9), anchor="center",
+        )
+        c.create_text(
+            cw / 2, ch - 26,
+            text="Formato no reconocido. Mostrando los primeros bytes en hexadecimal.",
+            fill=COL_MUTED, font=(FONT_FAMILY, 9),
+        )
+        self.preview_info.set(f"Binario  ·  {len(data):,} bytes")
 
     def _capture_tree(self, root: Node, codes: dict, freqs: dict) -> None:
         self.current_root = root
@@ -3326,8 +3989,8 @@ class App:
     def load_media(self) -> None:
         patterns = " ".join(f"*{ext}" for ext in MEDIA_EXTENSIONS.split())
         path = filedialog.askopenfilename(
-            title="Selecciona imagen o audio",
-            filetypes=[("Imagen y audio", patterns), ("Todos", "*.*")],
+            title="Selecciona archivo a codificar",
+            filetypes=[("Archivos compatibles", patterns), ("Todos", "*.*")],
         )
         if not path:
             return
