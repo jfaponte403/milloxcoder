@@ -24,7 +24,10 @@ __pycache__/
 build/
 dist/
 *.egg-info/
+*.spec
+milloxcoder.exe
 
 # Sistema operativo
 .DS_Store
 Thumbs.db
+.agents

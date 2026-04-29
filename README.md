@@ -73,6 +73,18 @@ python main.py
 pytest
 ```
 
+### Compilar a ejecutable (.exe en Windows)
+
+Requiere PyInstaller (se instala dentro del entorno virtual):
+
+```bash
+pip install pyinstaller
+pyinstaller --onefile --windowed --name milloxcoder main.py
+```
+
+El binario se genera en `dist/milloxcoder.exe`. Tambien puedes copiarlo a la
+raiz del proyecto para ejecutarlo comodamente; esta ignorado por git.
+
 ## Uso
 
 1. **Cargar imagen/audio**: abre el archivo de origen.
