@@ -8,6 +8,7 @@ import io
 import json
 import math
 import shutil
+import sys
 import tempfile
 import time
 import tkinter as tk
@@ -16,6 +17,16 @@ from tkinter import filedialog, font as tkfont, messagebox, scrolledtext, ttk
 
 import algorithms
 from huffman import Node
+
+
+def _resource_path(rel: str) -> Path:
+    """Resuelve la ruta de un recurso (icon.jpg, etc.) tanto cuando
+    corremos desde fuente como desde un bundle de PyInstaller. PyInstaller
+    extrae los datos a sys._MEIPASS en runtime."""
+    base = getattr(sys, "_MEIPASS", None)
+    if base is None:
+        base = Path(__file__).resolve().parent
+    return Path(base) / rel
 
 
 # ---------------------------------------------------------------------------
@@ -452,6 +463,20 @@ class App:
         self.root.minsize(1040, 680)
         self.root.resizable(True, True)
         self._center_window(1360, 880)
+
+        # Icono de la ventana / barra de tareas. Tk nativo solo lee
+        # GIF/PNG/PPM, asi que pasamos por PIL para soportar JPG.
+        # Mantenemos la referencia en self para que el GC no la libere
+        # (Tk no se queda con una referencia fuerte a la imagen).
+        try:
+            from PIL import Image, ImageTk
+            icon_path = _resource_path("icon.jpg")
+            if icon_path.exists():
+                self._app_icon = ImageTk.PhotoImage(Image.open(icon_path))
+                self.root.iconphoto(True, self._app_icon)
+        except Exception:
+            # El icono es nice-to-have: si falta o falla PIL, seguimos.
+            pass
 
         self.algorithm: str = algorithms.DEFAULT
         self.algorithm_var = tk.StringVar(value=self.algorithm)
@@ -5618,6 +5643,18 @@ class App:
 
 def main() -> None:
     global FONT_FAMILY, MONO_FAMILY
+    # Windows: registrar AppUserModelID propio para que la taskbar agrupe
+    # las ventanas bajo nuestra identidad y use el icono de la app en
+    # lugar de heredar el de python.exe. Debe llamarse antes de crear
+    # la ventana raiz.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "milloxcoder.app"
+            )
+        except Exception:
+            pass
     root = tk.Tk()
     FONT_FAMILY = _pick_font()
     MONO_FAMILY = _pick_mono()

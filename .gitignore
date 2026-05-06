@@ -26,6 +26,8 @@ dist/
 *.egg-info/
 *.spec
 milloxcoder.exe
+# icon.ico se genera automaticamente desde icon.jpg al ejecutar el spec
+icon.ico
 
 # Sistema operativo
 .DS_Store
