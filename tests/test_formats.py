@@ -372,3 +372,38 @@ class TestSuggestedDecodedName:
         from pathlib import Path
         name, ext = suggest(None, Path("coded-.txt"), png_bytes)
         assert name == "restored-media.png"
+
+    # --- prefijo de algoritmo en el nombre restaurado ---
+
+    def test_algorithm_prefix_with_loaded_path(self, suggest):
+        from pathlib import Path
+        name, ext = suggest(Path("xyz.png"), None, b"any",
+                            algorithm="huffman")
+        assert name == "restored-huffman-xyz.png"
+        assert ext == ".png"
+
+    def test_algorithm_prefix_with_rle(self, suggest, png_bytes):
+        name, ext = suggest(None, None, png_bytes, algorithm="rle")
+        assert name == "restored-rle-media.png"
+
+    def test_algorithm_prefix_strips_algo_segment_from_coded_source(
+            self, suggest, png_bytes):
+        from pathlib import Path
+        # coded-huffman-foto.txt -> stem 'foto'
+        name, ext = suggest(None, Path("coded-huffman-foto.txt"),
+                            png_bytes, algorithm="huffman")
+        assert name == "restored-huffman-foto.png"
+
+    def test_algorithm_prefix_handles_legacy_coded_source(
+            self, suggest, png_bytes):
+        from pathlib import Path
+        # archivo viejo sin segmento de algoritmo: coded-foto.txt
+        name, ext = suggest(None, Path("coded-foto.txt"),
+                            png_bytes, algorithm="rle")
+        assert name == "restored-rle-foto.png"
+
+    def test_no_algorithm_keeps_legacy_format(self, suggest):
+        from pathlib import Path
+        # algorithm=None preserva el comportamiento historico
+        name, _ = suggest(Path("xyz.png"), None, b"any")
+        assert name == "restored-xyz.png"

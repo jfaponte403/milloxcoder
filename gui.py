@@ -1,5 +1,6 @@
-"""Interfaz Tkinter de Milloxcoder: codificador/decodificador Huffman con
-visualizacion paso a paso y dashboard de teoria de la informacion."""
+"""Interfaz Tkinter de Milloxcoder: codificador/decodificador (Huffman,
+RLE) con visualizacion paso a paso, dashboard de teoria de
+la informacion y comparador de rendimiento."""
 
 from __future__ import annotations
 
@@ -8,11 +9,13 @@ import json
 import math
 import shutil
 import tempfile
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, font as tkfont, messagebox, scrolledtext, ttk
 
-from huffman import ALGORITHM_NAME, FORMAT_HEADER, Node, decode, encode
+import algorithms
+from huffman import Node
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +95,19 @@ COL_CHART_BAR = COL_ACCENT
 COL_CHART_TRACK = "#ECE6DA"
 COL_CHART_REF = "#1F1B17"
 
+# Colores de identidad por algoritmo (usados en la pestaña Comparacion).
+# Mantenidos desaturados para no romper la paleta calida; el vermellon de
+# Huffman es el acento real, RLE va con un purpura vecino.
+COL_ALG_HUFFMAN = COL_ACCENT          # vermellon
+COL_ALG_RLE = "#7A5BA0"               # purpura desaturado
+COL_BAR_ORIGINAL = COL_TREE_EDGE      # gris calido para la barra de referencia
+
+# Mapeo clave -> color
+ALG_COLORS = {
+    "huffman": COL_ALG_HUFFMAN,
+    "rle": COL_ALG_RLE,
+}
+
 
 # ---------------------------------------------------------------------------
 # RoundedButton
@@ -160,6 +176,99 @@ class RoundedButton(tk.Canvas):
         if (0 <= event.x <= self.w) and (0 <= event.y <= self.h):
             if self.command:
                 self.command()
+
+
+# ---------------------------------------------------------------------------
+# Pill toggle del selector de algoritmo (header, esquina superior derecha)
+# ---------------------------------------------------------------------------
+
+class AlgorithmPill(tk.Canvas):
+    """Pill con dot indicador + label. Estado activo/inactivo controlado por
+    la app. Click invoca command(key) si la pill no esta ya activa."""
+
+    def __init__(self, parent, *, text: str, key: str, command,
+                 parent_bg: str = COL_BG,
+                 padx: int = 14, pady: int = 7) -> None:
+        super().__init__(parent, bg=parent_bg, highlightthickness=0, bd=0)
+        self.key = key
+        self.text = text
+        self.command = command
+        self.parent_bg = parent_bg
+        self.font = (FONT_FAMILY, 9, "bold")
+        self._active = False
+        self._hover = False
+        self.dot_r = 4
+
+        # Medir texto para dimensionar la stadium-shape
+        tmp = self.create_text(0, 0, text=text, font=self.font, anchor="nw")
+        bbox = self.bbox(tmp)
+        self.delete(tmp)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        gap = 8  # dot ↔ texto
+        self.h = th + pady * 2
+        self.w = padx + self.dot_r * 2 + gap + tw + padx
+        self.configure(width=self.w, height=self.h)
+
+        self._draw()
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<ButtonPress-1>", self._on_click)
+
+    def _palette(self) -> tuple[str, str, str, str | None]:
+        """Devuelve (fill, dot, text, border) para el estado actual."""
+        if self._active:
+            return COL_ACCENT_SOFT, COL_ACCENT, COL_ACCENT_ACTIVE, None
+        if self._hover:
+            return COL_BORDER_SUBTLE, COL_SUBTLE, COL_INK, COL_BORDER
+        return COL_SURFACE, COL_SUBTLE, COL_INK, COL_BORDER
+
+    def _draw(self) -> None:
+        self.delete("all")
+        fill, dot, fg, border = self._palette()
+        r = self.h // 2
+        w, h = self.w, self.h
+        # Stadium = polygon redondeado con radio = h/2
+        pts = [
+            r, 0, w - r, 0, w, 0, w, r,
+            w, h - r, w, h, w - r, h,
+            r, h, 0, h, 0, h - r,
+            0, r, 0, 0, r, 0,
+        ]
+        self.create_polygon(
+            pts, smooth=True, splinesteps=18,
+            fill=fill, outline=border or fill,
+        )
+        cx = r + 2
+        cy = h // 2
+        self.create_oval(
+            cx - self.dot_r, cy - self.dot_r,
+            cx + self.dot_r, cy + self.dot_r,
+            fill=dot, outline=dot,
+        )
+        self.create_text(
+            cx + self.dot_r + 8, cy,
+            text=self.text, fill=fg, font=self.font, anchor="w",
+        )
+
+    def set_active(self, active: bool) -> None:
+        if self._active == active:
+            return
+        self._active = active
+        self._draw()
+
+    def _on_enter(self, _e) -> None:
+        self._hover = True
+        if not self._active:
+            self._draw()
+
+    def _on_leave(self, _e) -> None:
+        self._hover = False
+        if not self._active:
+            self._draw()
+
+    def _on_click(self, _e) -> None:
+        if self.command and not self._active:
+            self.command(self.key)
 
 
 # ---------------------------------------------------------------------------
@@ -262,8 +371,8 @@ class StepperBar(tk.Canvas):
 # Helpers de teoria de la informacion
 # ---------------------------------------------------------------------------
 
-def _calculate_metrics(freqs: dict, codes: dict) -> dict | None:
-    if not freqs or not codes:
+def _calculate_metrics(freqs: dict, codes: dict | None) -> dict | None:
+    if not freqs:
         return None
     total = sum(freqs.values())
     if total == 0:
@@ -274,6 +383,26 @@ def _calculate_metrics(freqs: dict, codes: dict) -> dict | None:
         if f > 0:
             p = f / total
             H -= p * math.log2(p)
+
+    # Sin codigos (RLE) la entropia sigue teniendo sentido pero L/R/eta y la
+    # distribucion de longitudes no aplican: el algoritmo no genera codigos
+    # de prefijo. Devolvemos las metricas calculables y dejamos las demas como
+    # None para que la GUI las muestre con EMPTY_VALUE.
+    if not codes:
+        return {
+            "entropy": H,
+            "mean_length": None,
+            "redundancy": None,
+            "efficiency": None,
+            "variance": None,
+            "std_dev": None,
+            "total_symbols": total,
+            "unique_symbols": len(freqs),
+            "min_code_len": None,
+            "max_code_len": None,
+            "code_length_distribution": [],
+            "has_codes": False,
+        }
 
     L = sum((freqs[b] / total) * len(codes[b]) for b in freqs)
     sigma2 = sum((freqs[b] / total) * (len(codes[b]) - L) ** 2 for b in freqs)
@@ -293,6 +422,7 @@ def _calculate_metrics(freqs: dict, codes: dict) -> dict | None:
         "min_code_len": min(code_lengths) if code_lengths else 0,
         "max_code_len": max(code_lengths) if code_lengths else 0,
         "code_length_distribution": _length_distribution(codes, freqs),
+        "has_codes": True,
     }
 
 
@@ -317,22 +447,46 @@ def _length_distribution(codes: dict, freqs: dict) -> list[tuple[int, int, int]]
 class App:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title("Milloxcoder · Huffman encoder y decoder")
+        self.root.title("Milloxcoder · Huffman / RLE")
         self.root.configure(bg=COL_BG)
         self.root.minsize(1040, 680)
         self.root.resizable(True, True)
         self._center_window(1360, 880)
+
+        self.algorithm: str = algorithms.DEFAULT
+        self.algorithm_var = tk.StringVar(value=self.algorithm)
+        self.algorithm_var.trace_add(
+            "write", lambda *_: self._on_algorithm_change()
+        )
+        self.algorithm_badge_var = tk.StringVar(
+            value=algorithms.get(self.algorithm).name.upper()
+        )
 
         self.loaded_bytes: bytes | None = None
         self.loaded_path: Path | None = None
         self.encoded_source_path: Path | None = None
         self.encoded_text: str | None = None
         self.decoded_bytes: bytes | None = None
+        self.current_algorithm: str | None = None  # algoritmo del ultimo encode/decode
         self.current_root: Node | None = None
         self.current_codes: dict | None = None
         self.current_freqs: dict | None = None
         self.current_metrics: dict | None = None
         self.last_action_label: str = "sin operacion"
+
+        # Estado de la pestana Comparacion: filas vivas + controles del
+        # toolbar. Se inicializan aqui para que existan antes de _build_ui.
+        self._compare_rows: list[dict] = []
+        self._compare_iterations_var = tk.StringVar(value="3")
+        self._compare_metric_var = tk.StringVar(value="size")
+        self._compare_type_var = tk.StringVar(value="Auto (detectado)")
+        self._compare_widgets: dict = {}  # populado por _build_compare_tab
+
+        # Cache por algoritmo poblada por do_encode (corre los dos algoritmos
+        # de una vez). Cambiar el pill solo cambia que entrada de la cache se
+        # muestra: no recodifica. clave -> dict con encoded_text/root/codes/
+        # freqs/metrics.
+        self._encoded_cache: dict[str, dict] = {}
 
         # Estado de reproduccion de la pestana 'Vista previa'.
         self._media_temp_dir: Path | None = None
@@ -458,6 +612,23 @@ class App:
                         background=COL_RAISED, troughcolor=COL_BG,
                         borderwidth=0, arrowcolor=COL_MUTED)
 
+        # (El selector de algoritmo es ahora AlgorithmPill, dibujado en
+        # Canvas; no requiere estilos ttk.)
+
+        # Treeview del comparador
+        style.configure("Compare.Treeview",
+                        background=COL_SURFACE, fieldbackground=COL_SURFACE,
+                        foreground=COL_INK, rowheight=30,
+                        borderwidth=0, font=(f, 10))
+        style.configure("Compare.Treeview.Heading",
+                        background=COL_RAISED, foreground=COL_MUTED,
+                        font=(f, 9, "bold"), relief="flat", borderwidth=0)
+        style.map("Compare.Treeview.Heading",
+                  background=[("active", COL_BORDER_SUBTLE)])
+        style.map("Compare.Treeview",
+                  background=[("selected", COL_ACCENT_SOFT)],
+                  foreground=[("selected", COL_INK)])
+
     # ------------------------------------------------------------------
     # UI build
     # ------------------------------------------------------------------
@@ -481,23 +652,37 @@ class App:
         ttk.Label(left, text="MILLOXCODER", style="Display.TLabel").pack(anchor="w")
         ttk.Label(
             left,
-            text="Codifica y decodifica imagen y audio con Huffman, viendo el algoritmo paso a paso.",
+            text="Codifica y decodifica imagen y audio con Huffman o RLE, "
+                 "comparando rendimiento y metricas paso a paso.",
             style="Subhead.TLabel",
         ).pack(anchor="w", pady=(2, 0))
 
         right = ttk.Frame(head, style="TFrame")
         right.pack(side=tk.RIGHT)
-        # Badge del algoritmo (acento suave)
-        badge = tk.Frame(right, bg=COL_ACCENT_SOFT, padx=12, pady=6)
-        badge.pack(side=tk.RIGHT)
-        tk.Label(
-            badge, text=ALGORITHM_NAME.upper(), bg=COL_ACCENT_SOFT,
-            fg=COL_ACCENT_ACTIVE, font=(FONT_FAMILY, 9, "bold"),
-        ).pack()
+        # Selector de algoritmo: tres pills toggle, la activa se ve en
+        # acento vermellon. Click en una pill no-activa muta algorithm_var
+        # y _on_algorithm_change actualiza el resto del estado.
+        self._algorithm_pills: dict[str, AlgorithmPill] = {}
+        for key in algorithms.ORDER:
+            alg = algorithms.get(key)
+            pill = AlgorithmPill(
+                right,
+                text=alg.short_name.upper(),
+                key=key,
+                command=lambda k: self.algorithm_var.set(k),
+                parent_bg=COL_BG,
+            )
+            pill.pack(side=tk.LEFT, padx=(6, 0))
+            self._algorithm_pills[key] = pill
+        # Estado inicial
+        self._algorithm_pills[self.algorithm].set_active(True)
 
     def _build_actions(self, parent: ttk.Frame) -> None:
         wrap = ttk.Frame(parent, style="TFrame")
         wrap.pack(fill=tk.X, pady=(0, 14))
+
+        # Selector de algoritmo: las pills viven en el header
+        # (_build_header). Aqui solo van las acciones.
 
         # Fila 1: acciones primarias
         primary_row = ttk.Frame(wrap, style="TFrame")
@@ -550,6 +735,34 @@ class App:
             parent_bg=COL_BG, padx=14, pady=8,
         ).pack(side=tk.LEFT, padx=(0, 6))
 
+    def _on_algorithm_change(self) -> None:
+        new_key = self.algorithm_var.get()
+        if new_key == self.algorithm:
+            return
+        self.algorithm = new_key
+        alg = algorithms.get(new_key)
+        self.algorithm_badge_var.set(alg.name.upper())
+        # Toggle visual de las pills.
+        if hasattr(self, "_algorithm_pills"):
+            for k, pill in self._algorithm_pills.items():
+                pill.set_active(k == new_key)
+
+        # Si la cache tiene el algoritmo, swap instantaneo: do_encode ya
+        # ejecuto los dos a la vez. Si no, simplemente actualizamos el
+        # selector y el usuario debera codificar.
+        if new_key in getattr(self, "_encoded_cache", {}):
+            self._apply_cache_to_ui(new_key, log_steps=True)
+            self._status(
+                f"Vista cambiada a {alg.name}.",
+                color=COL_OK,
+            )
+        else:
+            self._status(
+                f"Algoritmo activo: {alg.name}. "
+                "Pulsa 'Codificar' para ver sus metricas.",
+                color=COL_OK,
+            )
+
     def _build_filebar(self, parent: ttk.Frame) -> None:
         bar = tk.Frame(parent, bg=COL_RAISED, highlightthickness=0)
         bar.pack(fill=tk.X, pady=(0, 14))
@@ -578,6 +791,7 @@ class App:
         self._build_tree_tab(nb)
         self._build_output_tab(nb)
         self._build_preview_tab(nb)
+        self._build_compare_tab(nb)
 
     def _build_statusbar(self, parent: ttk.Frame) -> None:
         bar = ttk.Frame(parent, style="TFrame")
@@ -1067,7 +1281,26 @@ class App:
         if not m:
             return
         H = m["entropy"]
-        L = m["mean_length"]
+        L = m.get("mean_length")
+        if L is None:
+            # RLE: solo dibujar la entropia con un mensaje aclaratorio
+            c.update_idletasks()
+            w = max(c.winfo_width(), 1)
+            if w < 100:
+                return
+            c.create_text(
+                30, 28, anchor="w", fill=COL_INK,
+                font=(FONT_FAMILY, 10, "bold"),
+                text=f"H = {H:.4f} bits/byte",
+            )
+            c.create_text(
+                30, 56, anchor="w", fill=COL_MUTED,
+                font=(FONT_FAMILY, 9, "italic"),
+                width=max(w - 60, 200),
+                text="RLE no produce codigos de prefijo, asi que la longitud "
+                     "media L y la redundancia R no aplican.",
+            )
+            return
         if max(H, L) <= 0:
             return
 
@@ -1692,7 +1925,8 @@ class App:
     # Arbol: render
     # ------------------------------------------------------------------
 
-    def _draw_tree_placeholder(self) -> None:
+    def _draw_tree_placeholder(self, title: str | None = None,
+                                msg: str | None = None) -> None:
         c = self.tree_canvas
         c.delete("all")
         c.update_idletasks()
@@ -1700,16 +1934,26 @@ class App:
         h = max(c.winfo_height(), 1)
         c.create_text(
             w / 2, h / 2 - 10,
-            text="Aun no hay arbol.",
+            text=title or "Aun no hay arbol.",
             fill=COL_INK, font=(FONT_FAMILY, 13, "bold"),
         )
         c.create_text(
             w / 2, h / 2 + 16,
-            text="Codifica o decodifica un archivo para visualizarlo aqui.",
+            text=msg or "Codifica o decodifica un archivo para visualizarlo aqui.",
             fill=COL_MUTED, font=(FONT_FAMILY, 10),
+            width=max(w - 80, 200), justify="center",
         )
 
     def _redraw_tree(self) -> None:
+        # RLE no construye un arbol: en vez de un placeholder generico,
+        # explicamos por que esta pestana esta vacia para este algoritmo.
+        if self.current_algorithm == "rle":
+            self._draw_tree_placeholder(
+                title="RLE no usa arbol",
+                msg="Run-Length Encoding sustituye runs por (cuenta, byte). "
+                    "No hay codigos de prefijo, asi que no hay arbol que dibujar.",
+            )
+            return
         if self.current_root is None:
             self._draw_tree_placeholder()
             return
@@ -2052,8 +2296,8 @@ class App:
                   style="Eyebrow.TLabel").pack(anchor="w")
         ttk.Label(
             head,
-            text=f"Pega aqui el contenido completo de un .txt codificado, "
-                 f"empezando por '{FORMAT_HEADER}'.",
+            text="Pega aqui el contenido completo de un .txt codificado. "
+                 "Acepta cabeceras HUFFMAN_v1, SHANFAN_v1 o RLE_v1.",
             style="Subhead.TLabel",
         ).pack(anchor="w", pady=(2, 0))
 
@@ -2075,7 +2319,7 @@ class App:
 
         try:
             clip = self.root.clipboard_get()
-            if clip and clip.strip().startswith(FORMAT_HEADER):
+            if clip and algorithms.detect_from_header(clip.strip()):
                 txt.insert("1.0", clip)
         except tk.TclError:
             pass
@@ -2090,10 +2334,11 @@ class App:
                     "Vacio", "Pega contenido primero.",
                 )
                 return
-            if not content.startswith(FORMAT_HEADER):
+            if algorithms.detect_from_header(content) is None:
                 if not messagebox.askyesno(
                     "Cabecera no reconocida",
-                    f"El texto no empieza con '{FORMAT_HEADER}'. "
+                    "El texto no empieza con ninguna cabecera conocida "
+                    "(HUFFMAN_v1, SHANFAN_v1, RLE_v1). "
                     "¿Cargarlo de todos modos?",
                 ):
                     return
@@ -2841,12 +3086,17 @@ class App:
         )
         self.preview_info.set(f"Binario  ·  {len(data):,} bytes")
 
-    def _capture_tree(self, root: Node, codes: dict, freqs: dict) -> None:
+    def _capture_tree(self, root: Node | None, codes: dict | None,
+                       freqs: dict | None) -> None:
+        # Para RLE el codec llama con root=None y codes=None pero pasa
+        # frecuencias por byte para que el panel de analisis siga teniendo
+        # algo que mostrar.
         self.current_root = root
         self.current_codes = codes
         self.current_freqs = freqs
         self._redraw_tree()
-        self.root.after(50, self._center_tree)
+        if root is not None:
+            self.root.after(50, self._center_tree)
 
     # ------------------------------------------------------------------
     # Dashboard de analisis: refresh
@@ -2864,26 +3114,30 @@ class App:
         self.analysis_empty.pack_forget()
         self.analysis_content.pack(fill=tk.BOTH, expand=True)
 
+        has_codes = m.get("has_codes", True)
         H = m["entropy"]
-        L = m["mean_length"]
-        R = m["redundancy"]
-        eta = m["efficiency"]
 
         self.analysis_vars["H"].set(f"{H:.4f}")
-        self.analysis_vars["L"].set(f"{L:.4f}")
-        self.analysis_vars["R"].set(f"{R:+.4f}")
-        self.analysis_vars["eta"].set(f"{eta * 100:.2f} %")
-        self.analysis_vars["sigma2"].set(f"{m['variance']:.4f}")
-        self.analysis_vars["sigma"].set(f"{m['std_dev']:.4f}")
-        self.analysis_vars["min_len"].set(str(m["min_code_len"]))
-        self.analysis_vars["max_len"].set(str(m["max_code_len"]))
+        if has_codes:
+            self.analysis_vars["L"].set(f"{m['mean_length']:.4f}")
+            self.analysis_vars["R"].set(f"{m['redundancy']:+.4f}")
+            self.analysis_vars["eta"].set(f"{m['efficiency'] * 100:.2f} %")
+            self.analysis_vars["sigma2"].set(f"{m['variance']:.4f}")
+            self.analysis_vars["sigma"].set(f"{m['std_dev']:.4f}")
+            self.analysis_vars["min_len"].set(str(m["min_code_len"]))
+            self.analysis_vars["max_len"].set(str(m["max_code_len"]))
+        else:
+            # RLE: no hay codigos de prefijo, las metricas dependientes no
+            # aplican. Dejamos la entropia (que solo depende de frecuencias).
+            for key in ("L", "R", "eta", "sigma2", "sigma", "min_len", "max_len"):
+                self.analysis_vars[key].set(EMPTY_VALUE)
 
-        src = (
-            f"{self.last_action_label}  ·  "
-            f"{m['total_symbols']:,} bytes totales  ·  "
-            f"{m['unique_symbols']:,} simbolos unicos"
-        )
-        self.analysis_source_var.set(src)
+        src_parts = [self.last_action_label,
+                     f"{m['total_symbols']:,} bytes totales",
+                     f"{m['unique_symbols']:,} simbolos unicos"]
+        if not has_codes:
+            src_parts.append("L/R/η no aplican: RLE no genera codigos de prefijo")
+        self.analysis_source_var.set("  ·  ".join(src_parts))
 
         self._draw_compare()
         self._draw_distribution()
@@ -2909,6 +3163,16 @@ class App:
             messagebox.showinfo(
                 "Sin datos",
                 "Codifica o decodifica un archivo para ver los calculos.",
+            )
+            return
+
+        # Las metricas dependientes de codigos no aplican a RLE.
+        if key != "H" and not m.get("has_codes", True):
+            messagebox.showinfo(
+                "Metrica no aplicable",
+                "Esta metrica depende de codigos de prefijo y RLE no genera "
+                "ninguno. Solo la entropia (H) tiene sentido para este "
+                "algoritmo.",
             )
             return
 
@@ -4005,6 +4269,17 @@ class App:
         self.encoded_source_path = None
         self.encoded_text = None
         self.decoded_bytes = None
+        # Invalidar cache: el archivo cambio, hay que volver a codificar.
+        self._encoded_cache = {}
+        self._compare_rows = []
+        if hasattr(self, "_compare_tree"):
+            self._compare_render()
+            self._compare_subtitle_var.set(
+                "Mismo archivo, los algoritmos disponibles. "
+                "Pulsa Codificar."
+            )
+            self._compare_meta_var.set("benchmark · sin datos")
+            self._compare_type_var.set(self._detect_data_type_label())
         self.info_var.set(
             f"{p.name}  ·  {len(data):,} bytes  ·  {p.suffix or 'sin extension'}"
         )
@@ -4033,50 +4308,142 @@ class App:
                 "Primero carga una imagen o audio.",
             )
             return
-        self.log_text.delete("1.0", tk.END)
-        self._clear_output_panels()
-        self._reset_steps()
+        # Codificamos con TODOS los algoritmos en una pasada: el costo
+        # extra es bajo (un encode adicional) y a cambio el toggle de
+        # algoritmo en el header pasa a ser instantaneo y la pestana de
+        # Comparacion queda lista sin pulsar nada mas.
         self.root.config(cursor="watch")
         self.root.update_idletasks()
         try:
-            text = encode(self.loaded_bytes, log=self.log,
-                          on_tree=self._capture_tree)
+            rows = self._run_comparison(self.loaded_bytes, iterations=1)
         except Exception as e:
             messagebox.showerror("Error codificando", str(e))
             self._status("Error en la codificacion.", color=COL_WARN)
             return
         finally:
             self.root.config(cursor="")
+
+        # Poblar cache por algoritmo
+        self._encoded_cache = {}
+        for r in rows:
+            if not r.get("ok"):
+                continue
+            self._encoded_cache[r["key"]] = {
+                "encoded_text": r["_encoded_text"],
+                "root": r["_root"],
+                "codes": r["_codes"],
+                "freqs": r["_freqs"],
+                "metrics": r["_metrics"],
+            }
+
+        # Alimentar la pestana Comparacion (sin requerir Re-ejecutar).
+        self._compare_rows = rows
+        self._apply_compare_header(iterations=1)
+        self._compare_render()
+
+        # Pintar la vista del algoritmo seleccionado actualmente.
+        if self.algorithm not in self._encoded_cache:
+            messagebox.showerror(
+                "Error codificando",
+                f"El algoritmo {algorithms.get(self.algorithm).name} fallo. "
+                "Revisa el log o cambia de algoritmo.",
+            )
+            self._status("Error en la codificacion.", color=COL_WARN)
+            return
+        self._apply_cache_to_ui(self.algorithm, log_steps=True)
+
+        active = algorithms.get(self.algorithm)
+        n_out = self._encoded_cache[self.algorithm]["encoded_text"]
+        self._status(
+            f"Codificado con {active.name}: {len(n_out):,} caracteres. "
+            "Cambia de algoritmo en el header o abre Comparacion.",
+            color=COL_OK,
+        )
+
+    def _apply_cache_to_ui(self, key: str, *, log_steps: bool = False) -> None:
+        """Vuelca la entrada de cache del algoritmo `key` a los paneles de
+        la vista unica (Proceso, Arbol, Resultado, Analisis). No reejecuta
+        nada: solo lee de self._encoded_cache.
+
+        Si log_steps es True ademas reproduce el log paso a paso del
+        algoritmo (encode con log=self.log) para que el panel REGISTRO
+        muestre la cascada — usado tras do_encode."""
+        entry = self._encoded_cache.get(key)
+        if entry is None:
+            return
+        alg = algorithms.get(key)
+        text = entry["encoded_text"]
+
+        # Estado canonico
         self.encoded_text = text
+        self.current_algorithm = key
+        self.current_root = entry["root"]
+        self.current_codes = entry["codes"]
+        self.current_freqs = entry["freqs"]
+        self.current_metrics = entry["metrics"]
+
+        # Output panels (Resultado tab)
         self._set_output(text)
 
-        n_in = len(self.loaded_bytes)
+        # Steps + log
+        self._reset_steps()
+        if log_steps:
+            self.log_text.delete("1.0", tk.END)
+            try:
+                # Re-encode pero esta vez con log para repoblar el panel.
+                # Es el unico re-trabajo: aceptable por la riqueza pedagogica.
+                alg.encode(self.loaded_bytes or b"", log=self.log)
+            except Exception:
+                pass
+
+        # Tree
+        self._redraw_tree()
+        if self.current_root is not None:
+            self.root.after(50, self._center_tree)
+
+        # Metricas del header del Proceso tab
+        n_in = len(self.loaded_bytes or b"")
         n_out = len(text)
         n_sym = len(self.current_freqs or {})
-        bits_total = sum(
-            len(self.current_codes[b]) * f
-            for b, f in (self.current_freqs or {}).items()
-        )
-        ratio = bits_total / (n_in * 8) * 100 if n_in else 0
-        self._update_metrics(
-            input=f"{n_in:,} B",
-            symbols=str(n_sym),
-            bits=f"{bits_total:,}",
-            output=f"{n_out:,} ch",
-            ratio=f"{ratio:.1f} %",
-        )
+        if alg.has_tree and self.current_codes:
+            bits_total = sum(
+                len(self.current_codes[b]) * f
+                for b, f in (self.current_freqs or {}).items()
+            )
+            ratio = bits_total / (n_in * 8) * 100 if n_in else 0
+            self._update_metrics(
+                input=f"{n_in:,} B",
+                symbols=str(n_sym),
+                bits=f"{bits_total:,}",
+                output=f"{n_out:,} ch",
+                ratio=f"{ratio:.1f} %",
+            )
+        else:
+            ratio_chars = n_out / n_in * 100 if n_in else 0
+            self._update_metrics(
+                input=f"{n_in:,} B",
+                symbols=str(n_sym),
+                bits=EMPTY_VALUE,
+                output=f"{n_out:,} ch",
+                ratio=f"{ratio_chars:.1f} %",
+            )
 
-        # Calcular metricas de teoria de la informacion
-        self.current_metrics = _calculate_metrics(
-            self.current_freqs or {}, self.current_codes or {},
-        )
         name = self.loaded_path.name if self.loaded_path else "datos"
-        self.last_action_label = f"Codificacion · {name}"
+        self.last_action_label = f"{alg.name} · codificacion · {name}"
         self._refresh_analysis()
 
-        self._status(
-            f"Codificado: {n_out:,} caracteres. Mira 'Analisis' y 'Arbol'.",
-            color=COL_OK,
+    def _apply_compare_header(self, iterations: int) -> None:
+        """Actualiza el subtitulo y la metaetiqueta de la pestana Comparacion
+        a partir del archivo cargado y la cantidad de iteraciones usadas."""
+        src = self.loaded_path.name if self.loaded_path else "datos cargados"
+        self._compare_subtitle_var.set(
+            f"Mismo archivo, los algoritmos disponibles. Resultados sobre {src}."
+        )
+        self._compare_type_var.set(self._detect_data_type_label())
+        plural = "ejecucion" if iterations == 1 else "ejecuciones"
+        agg = "unico valor" if iterations == 1 else "mediana"
+        self._compare_meta_var.set(
+            f"benchmark · {iterations} {plural} · {agg}"
         )
 
     def load_encoded(self) -> None:
@@ -4115,12 +4482,31 @@ class App:
                 "'Pegar texto crudo' en la pestana Resultado.",
             )
             return
+
+        # Auto-detectar el algoritmo a partir de la cabecera, no del selector:
+        # el selector controla codificaciones nuevas; al decodificar mandamos
+        # lo que diga el archivo.
+        detected = algorithms.detect_from_header(text)
+        if detected is None:
+            messagebox.showerror(
+                "Cabecera desconocida",
+                "El texto no empieza con ninguna cabecera conocida "
+                "(HUFFMAN_v1, SHANFAN_v1, RLE_v1).",
+            )
+            self._status("Cabecera no reconocida.", color=COL_WARN)
+            return
+        alg = algorithms.get(detected)
+
+        # Sincronizar el selector con lo detectado.
+        if self.algorithm != detected:
+            self.algorithm_var.set(detected)
+
         self.log_text.delete("1.0", tk.END)
         self._reset_steps()
         self.root.config(cursor="watch")
         self.root.update_idletasks()
         try:
-            data = decode(text, log=self.log, on_tree=self._capture_tree)
+            data = alg.decode(text, log=self.log, on_tree=self._capture_tree)
         except Exception as e:
             messagebox.showerror("Error decodificando", str(e))
             self._status("Error en la decodificacion.", color=COL_WARN)
@@ -4128,6 +4514,7 @@ class App:
         finally:
             self.root.config(cursor="")
         self.decoded_bytes = data
+        self.current_algorithm = alg.key
         self._update_verification()
         self._set_preview(data)
         self._update_metrics(
@@ -4141,18 +4528,167 @@ class App:
         self.current_metrics = _calculate_metrics(
             self.current_freqs or {}, self.current_codes or {},
         )
-        self.last_action_label = "Decodificacion · datos reconstruidos"
+        self.last_action_label = f"{alg.name} · decodificacion"
         self._refresh_analysis()
 
         self._status(
-            f"Decodificado: {len(data):,} bytes reconstruidos.",
+            f"Decodificado con {alg.name}: {len(data):,} bytes reconstruidos.",
             color=COL_OK,
         )
         messagebox.showinfo(
             "Decodificacion lista",
+            f"Algoritmo detectado: {alg.name}.\n"
             f"Se reconstruyeron {len(data)} bytes. "
             "Guardalos con 'Restaurar media'.",
         )
+
+    # ------------------------------------------------------------------
+    # Comparador "Comparar todos"
+    # ------------------------------------------------------------------
+
+    def _run_comparison(self, data: bytes, iterations: int = 1) -> list[dict]:
+        """Ejecuta los algoritmos registrados sobre `data` y devuelve filas
+        con metricas comparables + el payload codificado en cada una. Sin
+        side effects sobre el estado de la app: solo captura via callbacks
+        locales y devuelve los rows.
+
+        Si iterations > 1, repite encode+decode N veces y reporta la mediana
+        de los tiempos. La RAM pico se mide via tracemalloc en una corrida
+        adicional aislada (mantiene la medida estable y evita doble conteo).
+
+        Cada fila incluye los campos privados '_encoded_text', '_root',
+        '_codes', '_freqs', '_metrics' para que do_encode pueda armar la
+        cache por algoritmo sin tener que volver a ejecutar nada."""
+        import statistics, tracemalloc
+        from collections import Counter
+
+        n_in = len(data)
+        # Entropia del input (en bits/byte). Sirve para R = L_universal - H
+        # incluso cuando el algoritmo no produce codigos (RLE).
+        if n_in:
+            cnt = Counter(data)
+            H_input = 0.0
+            for v in cnt.values():
+                p = v / n_in
+                H_input -= p * math.log2(p)
+        else:
+            H_input = 0.0
+
+        iterations = max(1, int(iterations))
+        rows: list[dict] = []
+        for key in algorithms.ORDER:
+            alg = algorithms.get(key)
+            captured: dict = {"root": None, "codes": None, "freqs": None}
+
+            def cb(root, codes, freqs, _c=captured):
+                _c["root"] = root
+                _c["codes"] = codes
+                _c["freqs"] = freqs
+
+            enc = ""
+            ok = False
+            err: str | None = None
+            enc_times: list[float] = []
+            dec_times: list[float] = []
+
+            try:
+                # Iteraciones para tiempos estables (mediana).
+                for i in range(iterations):
+                    t0 = time.perf_counter()
+                    # Solo capturamos arbol/freqs en la primera corrida.
+                    cb_used = cb if i == 0 else None
+                    enc = alg.encode(data, on_tree=cb_used)
+                    enc_times.append(time.perf_counter() - t0)
+
+                    t1 = time.perf_counter()
+                    dec = alg.decode(enc)
+                    dec_times.append(time.perf_counter() - t1)
+
+                    if i == 0:
+                        ok = dec == data
+            except Exception as e:
+                err = str(e)
+                if not enc_times:
+                    enc_times = [0.0]
+                if not dec_times:
+                    dec_times = [0.0]
+
+            t_enc = statistics.median(enc_times)
+            t_dec = statistics.median(dec_times)
+
+            # RAM pico: corrida aislada con tracemalloc. Si encode falla
+            # antes, peak queda en 0 y la celda muestra EMPTY_VALUE.
+            peak_ram = 0
+            if enc and not err:
+                try:
+                    tracemalloc.start()
+                    _enc2 = alg.encode(data)
+                    _dec2 = alg.decode(_enc2)
+                    _peak_curr, peak_ram = tracemalloc.get_traced_memory()
+                    tracemalloc.stop()
+                except Exception:
+                    if tracemalloc.is_tracing():
+                        tracemalloc.stop()
+                    peak_ram = 0
+
+            metrics = _calculate_metrics(captured["freqs"] or {},
+                                         captured["codes"]) if enc else None
+
+            # Bits codificados para entropy coders.
+            if alg.has_tree and metrics and captured["codes"]:
+                bits = sum(len(captured["codes"][b]) * f
+                           for b, f in (captured["freqs"] or {}).items())
+            else:
+                bits = None
+
+            # L_universal: bits/simbolo del codigo. Para entropy coders es
+            # mean_length (bits del codigo de prefijo) — la magnitud que
+            # tiene sentido teorico contra la entropia. Para algoritmos sin
+            # codigos (RLE) lo derivamos del payload usando
+            # (len(enc) caracteres * 8 bits) / n_in — expone claramente la
+            # expansion (>8 bits/simb) propia del wire format.
+            if metrics and metrics.get("mean_length") is not None:
+                L_universal = metrics["mean_length"]
+            elif n_in and enc:
+                L_universal = (len(enc) * 8) / n_in
+            else:
+                L_universal = None
+            R_universal = (L_universal - H_input) if L_universal is not None else None
+
+            rows.append({
+                "key": key,
+                "name": alg.name,
+                "short": alg.short_name,
+                "color": ALG_COLORS.get(key, COL_INK),
+                "n_in": n_in,
+                "n_out_chars": len(enc),
+                "bits": bits,
+                "ratio_chars": (len(enc) / n_in * 100) if n_in else 0.0,
+                "ratio_bits": (bits / (n_in * 8) * 100) if (bits and n_in) else None,
+                "delta_pct": ((len(enc) - n_in) / n_in * 100) if n_in else 0.0,
+                "time_enc_ms": t_enc * 1000,
+                "time_dec_ms": t_dec * 1000,
+                "time_total_ms": (t_enc + t_dec) * 1000,
+                "entropy": metrics["entropy"] if metrics else None,
+                "entropy_input": H_input,
+                "mean_length": metrics["mean_length"] if metrics else None,
+                "L_universal": L_universal,
+                "R_universal": R_universal,
+                "redundancy": metrics["redundancy"] if metrics else None,
+                "efficiency": metrics["efficiency"] if metrics else None,
+                "unique_symbols": metrics["unique_symbols"] if metrics else 0,
+                "peak_ram": peak_ram,
+                "iterations": iterations,
+                "ok": ok,
+                "error": err,
+                # Payload + estado privado para alimentar la cache de la GUI.
+                "_encoded_text": enc if ok else "",
+                "_root": captured["root"],
+                "_codes": captured["codes"],
+                "_freqs": captured["freqs"],
+                "_metrics": metrics,
+            })
+        return rows
 
     def save_encoded(self) -> None:
         if not self.encoded_text:
@@ -4161,10 +4697,15 @@ class App:
                 "Primero codifica un archivo.",
             )
             return
+        # El algoritmo va como segmento en el nombre del archivo: asi al
+        # decodificar mas tarde es trivial saber con que se codifico, y
+        # facilita coexistir varias codificaciones del mismo input en una
+        # misma carpeta.
+        algo_seg = self.current_algorithm or self.algorithm or "huffman"
         if self.loaded_path is not None:
-            default = f"coded-{self.loaded_path.stem}.txt"
+            default = f"coded-{algo_seg}-{self.loaded_path.stem}.txt"
         else:
-            default = "coded-media.txt"
+            default = f"coded-{algo_seg}-media.txt"
         path = filedialog.asksaveasfilename(
             title="Guardar resultado codificado",
             defaultextension=".txt",
@@ -4236,14 +4777,20 @@ class App:
     @staticmethod
     def _suggest_decoded_name(loaded_path,
                               encoded_source_path,
-                              decoded_bytes: bytes | None) -> tuple[str, str]:
+                              decoded_bytes: bytes | None,
+                              algorithm: str | None = None) -> tuple[str, str]:
         """Devuelve (nombre_por_defecto, extension) para 'Restaurar media'.
 
-        Prioridad:
+        Prioridad para el stem:
           1. loaded_path: usa stem y suffix (caso estandar).
-          2. encoded_source_path 'coded-xyz.txt': recupera stem 'xyz', y la
-             extension se olfatea de los bytes decodificados.
-          3. Generico 'media' + olfateo de extension.
+          2. encoded_source_path 'coded-{algo}-xyz.txt' o 'coded-xyz.txt':
+             recupera stem 'xyz', strippeando el prefijo 'coded-' y, si
+             existe, el segmento de algoritmo.
+          3. Generico 'media' + olfateo de extension a partir de los bytes.
+
+        Si algorithm se proporciona, el archivo restaurado se prefija con
+        el nombre del algoritmo: 'restored-{algorithm}-{stem}{ext}'. Sin
+        algorithm se usa el formato historico 'restored-{stem}{ext}'.
         """
         if loaded_path is not None:
             stem = loaded_path.stem
@@ -4252,12 +4799,23 @@ class App:
             if encoded_source_path is not None:
                 enc_stem = encoded_source_path.stem
                 if enc_stem.startswith("coded-"):
-                    stem = enc_stem[len("coded-"):] or "media"
+                    rest = enc_stem[len("coded-"):]
+                    # Si el siguiente segmento es un algoritmo conocido,
+                    # tambien se quita: 'coded-huffman-foo' -> 'foo'.
+                    import algorithms as _alg
+                    for k in _alg.ORDER:
+                        pref = f"{k}-"
+                        if rest.startswith(pref):
+                            rest = rest[len(pref):]
+                            break
+                    stem = rest or "media"
                 else:
                     stem = enc_stem
             else:
                 stem = "media"
             ext = App._sniff_extension(decoded_bytes or b"")
+        if algorithm:
+            return f"restored-{algorithm}-{stem}{ext}", ext
         return f"restored-{stem}{ext}", ext
 
     def save_decoded(self) -> None:
@@ -4272,6 +4830,7 @@ class App:
             self.loaded_path,
             self.encoded_source_path,
             self.decoded_bytes,
+            algorithm=self.current_algorithm or self.algorithm,
         )
 
         if ext:
@@ -4320,11 +4879,23 @@ class App:
         self.encoded_source_path = None
         self.encoded_text = None
         self.decoded_bytes = None
+        self.current_algorithm = None
         self.current_root = None
         self.current_codes = None
         self.current_freqs = None
         self.current_metrics = None
         self.last_action_label = "sin operacion"
+        # Invalidar cache + estado de la pestana Comparacion.
+        self._encoded_cache = {}
+        self._compare_rows = []
+        if hasattr(self, "_compare_tree"):
+            self._compare_render()
+            self._compare_subtitle_var.set(
+                "Mismo archivo, los algoritmos disponibles. "
+                "Carga un archivo y pulsa Codificar."
+            )
+            self._compare_meta_var.set("benchmark · sin datos")
+            self._compare_type_var.set("Auto (detectado)")
         self.log_text.delete("1.0", tk.END)
         self._clear_output_panels()
         self.info_var.set("Sin archivo cargado.")
@@ -4336,6 +4907,713 @@ class App:
         self._set_preview(None)
         self._refresh_analysis()
         self._status("Listo.", color=COL_OK)
+
+
+    # ==================================================================
+    # Tab: Comparacion (NEW)
+    # ==================================================================
+
+    def _make_new_badge_image(self) -> "tk.PhotoImage | None":
+        """Pequeno chip vermellon con texto "NEW" para anclarlo en el titulo
+        de la pestana via Notebook compound."""
+        try:
+            from PIL import Image, ImageDraw, ImageFont, ImageTk
+        except Exception:
+            return None
+        w, h = 36, 14
+        img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        draw.rounded_rectangle((0, 0, w - 1, h - 1),
+                               radius=h // 2, fill=COL_ACCENT)
+        font = None
+        for face in ("arialbd.ttf", "Arial Bold.ttf", "DejaVuSans-Bold.ttf"):
+            try:
+                font = ImageFont.truetype(face, 8)
+                break
+            except Exception:
+                continue
+        if font is None:
+            font = ImageFont.load_default()
+        text = "NEW"
+        bbox = draw.textbbox((0, 0), text, font=font)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        draw.text(((w - tw) / 2 - bbox[0],
+                   (h - th) / 2 - bbox[1] - 1),
+                  text, fill="#FFFFFF", font=font)
+        return ImageTk.PhotoImage(img)
+
+    def _make_dot_swatch(self, color: str) -> "tk.PhotoImage | None":
+        """Swatch 14x14 con un dot del color del algoritmo, para el #0
+        de la Treeview de la tabla detallada."""
+        try:
+            from PIL import Image, ImageDraw, ImageTk
+        except Exception:
+            return None
+        size = 14
+        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        r = 4
+        cx = size // 2
+        cy = size // 2
+        draw.ellipse((cx - r, cy - r, cx + r, cy + r), fill=color)
+        return ImageTk.PhotoImage(img)
+
+    def _detect_data_type_label(self) -> str:
+        if not self.loaded_path:
+            return "Auto (detectado)"
+        ext = self.loaded_path.suffix.lower() or "(sin ext)"
+        ax = ext.lstrip(".")
+        if ext in {".mp3", ".aac", ".ogg", ".flac", ".m4a", ".opus"}:
+            return f"Audio ({ext}, comprimido)"
+        if ext in {".wav", ".aiff", ".au"}:
+            return f"Audio ({ext}, sin comprimir)"
+        if ext in {".jpg", ".jpeg", ".webp", ".heic"}:
+            return f"Imagen ({ext}, comprimida)"
+        if ext in {".png", ".gif", ".tiff", ".bmp"}:
+            return f"Imagen ({ext})"
+        if ext in {".mp4", ".avi", ".mov", ".mkv", ".webm"}:
+            return f"Video ({ext})"
+        if ext in {".pdf"}:
+            return f"Documento ({ext})"
+        if ext in {".txt", ".md", ".csv", ".json", ".xml", ".html"}:
+            return f"Texto ({ext})"
+        return f"Binario ({ext})"
+
+    @staticmethod
+    def _fmt_bytes(n: int) -> str:
+        # Formato local-ish con punto de millares (estilo mockup: 189.789 B)
+        if n is None:
+            return EMPTY_VALUE
+        s = f"{n:,}".replace(",", ".")
+        if n < 1024:
+            return f"{s} B"
+        if n < 1024 * 1024:
+            return f"{s} B"  # mantenemos B para matchear el mockup
+        return f"{s} B"
+
+    @staticmethod
+    def _fmt_ram(peak_bytes: int) -> str:
+        if not peak_bytes:
+            return EMPTY_VALUE
+        mb = peak_bytes / (1024 * 1024)
+        if mb >= 1:
+            return f"{mb:.1f} MB"
+        kb = peak_bytes / 1024
+        return f"{kb:.0f} KB"
+
+    def _build_compare_tab(self, nb: ttk.Notebook) -> None:
+        frame = tk.Frame(nb, bg=COL_BG)
+        self._compare_tab_frame = frame
+        self._compare_new_badge = self._make_new_badge_image()
+        if self._compare_new_badge is not None:
+            nb.add(frame, text=" Comparacion ",
+                   image=self._compare_new_badge, compound="right")
+        else:
+            nb.add(frame, text=" Comparacion · NEW ")
+        self._compare_tab_index = nb.index("end") - 1
+
+        # Scrollable body
+        canvas = tk.Canvas(frame, bg=COL_BG, highlightthickness=0)
+        vbar = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vbar.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        vbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        scroll_frame = tk.Frame(canvas, bg=COL_BG)
+        scroll_window = canvas.create_window((0, 0), window=scroll_frame,
+                                             anchor="nw")
+        scroll_frame.bind(
+            "<Configure>",
+            lambda _e: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        canvas.bind(
+            "<Configure>",
+            lambda e: canvas.itemconfigure(scroll_window, width=e.width),
+        )
+
+        body = tk.Frame(scroll_frame, bg=COL_BG)
+        body.pack(fill=tk.BOTH, expand=True, padx=4, pady=12)
+
+        # ----- A. Header -----
+        head = tk.Frame(body, bg=COL_BG)
+        head.pack(fill=tk.X)
+        head_left = tk.Frame(head, bg=COL_BG)
+        head_left.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(head_left, text="COMPARACION DE RENDIMIENTO",
+                  style="Eyebrow.TLabel").pack(anchor="w")
+        self._compare_subtitle_var = tk.StringVar(
+            value="Mismo archivo, los tres algoritmos. "
+                  "Carga un archivo y pulsa Re-ejecutar."
+        )
+        tk.Label(
+            head_left, textvariable=self._compare_subtitle_var,
+            bg=COL_BG, fg=COL_MUTED, font=(FONT_FAMILY, 10),
+            anchor="w", justify="left",
+        ).pack(anchor="w", pady=(2, 0))
+
+        self._compare_meta_var = tk.StringVar(value="benchmark · sin datos")
+        tk.Label(
+            head, textvariable=self._compare_meta_var,
+            bg=COL_BG, fg=COL_MUTED, font=(FONT_FAMILY, 9),
+        ).pack(side=tk.RIGHT, anchor="ne")
+
+        # ----- B. Toolbar -----
+        toolbar = tk.Frame(body, bg=COL_RAISED)
+        toolbar.pack(fill=tk.X, pady=(14, 14))
+        tb_inner = tk.Frame(toolbar, bg=COL_RAISED)
+        tb_inner.pack(fill=tk.X, padx=14, pady=10)
+
+        # METRICA segmented
+        ttk.Label(tb_inner, text="METRICA", style="Eyebrow.TLabel").pack(
+            side=tk.LEFT, padx=(0, 10)
+        )
+        seg_frame = tk.Frame(tb_inner, bg=COL_RAISED)
+        seg_frame.pack(side=tk.LEFT, padx=(0, 22))
+        self._compare_seg_buttons: dict[str, RoundedButton] = {}
+        for key, label in (("size", "Tamaño"),
+                           ("speed", "Velocidad"),
+                           ("redundancy", "Redundancia")):
+            btn = RoundedButton(
+                seg_frame, text=label,
+                command=lambda k=key: self._compare_set_metric(k),
+                bg=COL_RAISED, fg=COL_MUTED,
+                hover_bg=COL_BORDER_SUBTLE, active_bg=COL_BORDER,
+                parent_bg=COL_RAISED, padx=12, pady=6, radius=5,
+            )
+            btn.pack(side=tk.LEFT, padx=(0, 4))
+            self._compare_seg_buttons[key] = btn
+
+        # TIPO (display read-only del kind detectado)
+        ttk.Label(tb_inner, text="TIPO", style="Eyebrow.TLabel").pack(
+            side=tk.LEFT, padx=(0, 8)
+        )
+        tipo_box = tk.Frame(tb_inner, bg=COL_SURFACE,
+                            highlightbackground=COL_BORDER,
+                            highlightthickness=1)
+        tipo_box.pack(side=tk.LEFT, padx=(0, 22))
+        tk.Label(
+            tipo_box, textvariable=self._compare_type_var,
+            bg=COL_SURFACE, fg=COL_INK, font=(FONT_FAMILY, 9),
+            padx=10, pady=4,
+        ).pack()
+
+        # ITERACIONES dropdown
+        ttk.Label(tb_inner, text="ITERACIONES", style="Eyebrow.TLabel").pack(
+            side=tk.LEFT, padx=(0, 8)
+        )
+        iter_box = tk.Frame(tb_inner, bg=COL_SURFACE,
+                            highlightbackground=COL_BORDER,
+                            highlightthickness=1)
+        iter_box.pack(side=tk.LEFT, padx=(0, 8))
+        spin = tk.Spinbox(
+            iter_box, from_=1, to=11, increment=2, width=4,
+            textvariable=self._compare_iterations_var,
+            bg=COL_SURFACE, fg=COL_INK, font=(FONT_FAMILY, 9),
+            relief="flat", buttonbackground=COL_RAISED,
+            highlightthickness=0, bd=0,
+        )
+        spin.pack(padx=8, pady=2)
+
+        # Acciones derecha: Exportar CSV + Re-ejecutar
+        RoundedButton(
+            tb_inner, text="Re-ejecutar", command=self._compare_run, bold=True,
+            bg=COL_ACCENT, fg="#FFFFFF",
+            hover_bg=COL_ACCENT_HOVER, active_bg=COL_ACCENT_ACTIVE,
+            parent_bg=COL_RAISED, padx=14, pady=7,
+        ).pack(side=tk.RIGHT)
+        RoundedButton(
+            tb_inner, text="Exportar CSV", command=self._compare_export_csv,
+            bg=COL_SURFACE, fg=COL_INK,
+            hover_bg=COL_BORDER_SUBTLE, active_bg=COL_BORDER,
+            parent_bg=COL_RAISED, padx=14, pady=7,
+            border=COL_BORDER,
+        ).pack(side=tk.RIGHT, padx=(0, 6))
+
+        # ----- C. KPI cards (4) -----
+        kpis_row = tk.Frame(body, bg=COL_BG)
+        kpis_row.pack(fill=tk.X, pady=(0, 14))
+        self._compare_kpi_cards: list[dict] = []
+        kpi_specs = [
+            ("TASA MAS BAJA", "MENOR TAMAÑO"),
+            ("ENCODE + DECODE", "MAS RAPIDO"),
+            ("MENOR REDUNDANCIA", "OPTIMO"),
+            ("PICO RAM", "MENOR MEMORIA"),
+        ]
+        for i, (eyebrow, badge) in enumerate(kpi_specs):
+            card = tk.Frame(kpis_row, bg=COL_RAISED)
+            pad = (0, 8) if i < len(kpi_specs) - 1 else (0, 0)
+            card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=pad)
+            inner = tk.Frame(card, bg=COL_RAISED)
+            inner.pack(fill=tk.BOTH, expand=True, padx=14, pady=12)
+
+            top = tk.Frame(inner, bg=COL_RAISED)
+            top.pack(fill=tk.X)
+            tk.Label(top, text=eyebrow, bg=COL_RAISED, fg=COL_MUTED,
+                     font=(FONT_FAMILY, 8, "bold")).pack(side=tk.LEFT)
+            badge_lbl = tk.Label(
+                top, text=" " + badge + " ",
+                bg=COL_ACCENT, fg="#FFFFFF",
+                font=(FONT_FAMILY, 7, "bold"), padx=4, pady=1,
+            )
+            badge_lbl.pack(side=tk.RIGHT)
+
+            big_var = tk.StringVar(value=EMPTY_VALUE)
+            sub_var = tk.StringVar(value="·")
+            tk.Label(
+                inner, textvariable=big_var, bg=COL_RAISED, fg=COL_INK,
+                font=(FONT_FAMILY, 16, "bold"),
+            ).pack(anchor="w", pady=(8, 2))
+            tk.Label(
+                inner, textvariable=sub_var, bg=COL_RAISED, fg=COL_MUTED,
+                font=(FONT_FAMILY, 9),
+            ).pack(anchor="w")
+            self._compare_kpi_cards.append({
+                "big": big_var, "sub": sub_var, "badge": badge_lbl,
+            })
+
+        # ----- D. Bar chart "Tamaño de salida" -----
+        bars_panel = tk.Frame(body, bg=COL_RAISED)
+        bars_panel.pack(fill=tk.X, pady=(0, 14))
+        bp_inner = tk.Frame(bars_panel, bg=COL_RAISED)
+        bp_inner.pack(fill=tk.X, padx=18, pady=14)
+        tk.Label(bp_inner, text="Tamaño de salida", bg=COL_RAISED,
+                 fg=COL_INK, font=(FONT_FAMILY, 11, "bold")).pack(anchor="w")
+        tk.Label(
+            bp_inner,
+            text="Bytes de salida tras codificacion. "
+                 "Barra gris = tamano del archivo original como referencia.",
+            bg=COL_RAISED, fg=COL_MUTED, font=(FONT_FAMILY, 9),
+        ).pack(anchor="w", pady=(2, 10))
+        self._compare_bars_canvas = tk.Canvas(
+            bp_inner, bg=COL_RAISED, highlightthickness=0, height=160,
+        )
+        self._compare_bars_canvas.pack(fill=tk.X)
+        self._compare_bars_canvas.bind(
+            "<Configure>", lambda _e: self._compare_render_bars()
+        )
+
+        # ----- E. Detailed table -----
+        tbl_panel = tk.Frame(body, bg=COL_BG)
+        tbl_panel.pack(fill=tk.X, pady=(0, 14))
+        tk.Label(tbl_panel, text="TABLA DETALLADA", bg=COL_BG,
+                 fg=COL_INK, font=(FONT_FAMILY, 9, "bold")).pack(anchor="w")
+        tt_sub = tk.Frame(tbl_panel, bg=COL_BG)
+        tt_sub.pack(fill=tk.X)
+        tk.Label(tt_sub, text="Filas en orden de mejor tasa de compresion.",
+                 bg=COL_BG, fg=COL_MUTED, font=(FONT_FAMILY, 9)).pack(
+            side=tk.LEFT, pady=(2, 8)
+        )
+        tk.Label(tt_sub, text="* = mejor en cada columna", bg=COL_BG,
+                 fg=COL_MUTED, font=(FONT_FAMILY, 9)).pack(
+            side=tk.RIGHT, pady=(2, 8)
+        )
+
+        cols = (
+            ("bytes",  "BYTES SALIDA",   110, "e"),
+            ("tasa",   "TASA",            80, "e"),
+            ("delta",  "Δ VS ORIGINAL",  120, "e"),
+            ("L",      "L (BITS/SIMB)",  120, "e"),
+            ("R",      "R (L-H)",         90, "e"),
+            ("enc",    "ENCODE (MS)",    100, "e"),
+            ("dec",    "DECODE (MS)",    100, "e"),
+            ("ram",    "RAM PICO",        90, "e"),
+        )
+        tbl_wrap = tk.Frame(tbl_panel, bg=COL_BORDER)
+        tbl_wrap.pack(fill=tk.X)
+        tree = ttk.Treeview(
+            tbl_wrap, columns=[c[0] for c in cols],
+            show="tree headings", height=3, style="Compare.Treeview",
+        )
+        tree.heading("#0", text="ALGORITMO", anchor="w")
+        tree.column("#0", width=160, anchor="w", stretch=False)
+        for cid, cname, cw, anchor in cols:
+            tree.heading(cid, text=cname, anchor=anchor)
+            tree.column(cid, width=cw, anchor=anchor, stretch=True)
+        tree.pack(fill=tk.X, padx=1, pady=1)
+        tree.tag_configure("delta_pos", foreground=COL_ACCENT_ACTIVE)
+        tree.tag_configure("delta_neg", foreground=COL_OK)
+        self._compare_tree = tree
+        # Pre-renderizamos las swatches por algoritmo (las imagenes deben
+        # vivir mientras la Treeview las referencia).
+        self._compare_swatches: dict[str, "tk.PhotoImage"] = {}
+        for k, color in ALG_COLORS.items():
+            sw = self._make_dot_swatch(color)
+            if sw is not None:
+                self._compare_swatches[k] = sw
+
+        # ----- F. Scatter plot "Velocidad vs. compresion" -----
+        sc_panel = tk.Frame(body, bg=COL_RAISED)
+        sc_panel.pack(fill=tk.X, pady=(0, 6))
+        sc_inner = tk.Frame(sc_panel, bg=COL_RAISED)
+        sc_inner.pack(fill=tk.X, padx=18, pady=14)
+        tk.Label(sc_inner, text="Velocidad vs. compresion", bg=COL_RAISED,
+                 fg=COL_INK, font=(FONT_FAMILY, 11, "bold")).pack(anchor="w")
+        tk.Label(
+            sc_inner,
+            text="Eje X: tasa de compresion (menor = mejor). "
+                 "Eje Y: tiempo total (menor = mejor). "
+                 "El cuadrante inferior izquierdo es el ideal.",
+            bg=COL_RAISED, fg=COL_MUTED, font=(FONT_FAMILY, 9),
+        ).pack(anchor="w", pady=(2, 10))
+        self._compare_scatter_canvas = tk.Canvas(
+            sc_inner, bg=COL_RAISED, highlightthickness=0, height=240,
+        )
+        self._compare_scatter_canvas.pack(fill=tk.X)
+        self._compare_scatter_canvas.bind(
+            "<Configure>", lambda _e: self._compare_render_scatter()
+        )
+
+        # Estado inicial: pinta empty + sincroniza segmented
+        self._compare_set_metric(self._compare_metric_var.get(),
+                                 rerender=False)
+
+    # ------------------------------------------------------------------
+    # Compare tab: estado y render
+    # ------------------------------------------------------------------
+
+    def _compare_set_metric(self, key: str, *, rerender: bool = True) -> None:
+        self._compare_metric_var.set(key)
+        if hasattr(self, "_compare_seg_buttons"):
+            for k, btn in self._compare_seg_buttons.items():
+                if k == key:
+                    btn.bg = COL_INK
+                    btn.fg = "#FFFFFF"
+                    btn.hover_bg = "#34302B"
+                    btn.active_bg = "#0F0D0B"
+                else:
+                    btn.bg = COL_RAISED
+                    btn.fg = COL_MUTED
+                    btn.hover_bg = COL_BORDER_SUBTLE
+                    btn.active_bg = COL_BORDER
+                btn._draw(btn.bg)
+        if rerender and self._compare_rows:
+            self._compare_render_table()
+
+    def _compare_run(self) -> None:
+        if not self.loaded_bytes:
+            messagebox.showwarning(
+                "Falta archivo",
+                "Primero carga una imagen, audio u otro archivo y pulsa "
+                "Codificar.",
+            )
+            return
+        try:
+            iters = max(1, int(self._compare_iterations_var.get()))
+        except ValueError:
+            iters = 3
+        self.root.config(cursor="watch")
+        self.root.update_idletasks()
+        try:
+            rows = self._run_comparison(self.loaded_bytes, iterations=iters)
+        except Exception as e:
+            messagebox.showerror("Error en comparacion", str(e))
+            self._status("Error en la comparacion.", color=COL_WARN)
+            return
+        finally:
+            self.root.config(cursor="")
+        # Re-ejecutar tambien refresca la cache de la vista unica para
+        # mantener todo coherente entre pestañas.
+        self._compare_rows = rows
+        self._encoded_cache = {}
+        for r in rows:
+            if not r.get("ok"):
+                continue
+            self._encoded_cache[r["key"]] = {
+                "encoded_text": r["_encoded_text"],
+                "root": r["_root"],
+                "codes": r["_codes"],
+                "freqs": r["_freqs"],
+                "metrics": r["_metrics"],
+            }
+        self._apply_compare_header(iterations=iters)
+        self._compare_render()
+        n_in = rows[0]["n_in"] if rows else 0
+        self._status(
+            f"Comparacion lista: {len(rows)} algoritmos sobre "
+            f"{n_in:,} bytes ({iters} iter).",
+            color=COL_OK,
+        )
+
+    def _compare_render(self) -> None:
+        self._compare_render_kpis()
+        self._compare_render_bars()
+        self._compare_render_table()
+        self._compare_render_scatter()
+
+    def _compare_render_kpis(self) -> None:
+        rows = self._compare_rows
+        valid = [r for r in rows if r.get("ok") and r["n_out_chars"] > 0]
+        cards = self._compare_kpi_cards
+        if not valid:
+            for c in cards:
+                c["big"].set(EMPTY_VALUE)
+                c["sub"].set("Sin datos.")
+            return
+
+        # 1. Tasa mas baja (menor tamano de salida vs input)
+        best_size = min(valid, key=lambda r: r["ratio_chars"])
+        cards[0]["big"].set(best_size["short"])
+        cards[0]["sub"].set(f"{best_size['ratio_chars']:.2f} % del original")
+
+        # 2. Encode + decode mas rapido
+        best_speed = min(valid, key=lambda r: r["time_total_ms"])
+        cards[1]["big"].set(best_speed["short"])
+        cards[1]["sub"].set(f"{best_speed['time_total_ms']:.0f} ms total")
+
+        # 3. Menor redundancia (R = L - H mas cercana a 0 por arriba)
+        red_pool = [r for r in valid if r.get("R_universal") is not None]
+        if red_pool:
+            best_red = min(red_pool, key=lambda r: abs(r["R_universal"]))
+            cards[2]["big"].set(best_red["short"])
+            cards[2]["sub"].set(f"R = {best_red['R_universal']:+.4f} bits/simb")
+        else:
+            cards[2]["big"].set(EMPTY_VALUE)
+            cards[2]["sub"].set("·")
+
+        # 4. Pico RAM mas bajo
+        ram_pool = [r for r in valid if r.get("peak_ram")]
+        if ram_pool:
+            best_ram = min(ram_pool, key=lambda r: r["peak_ram"])
+            cards[3]["big"].set(best_ram["short"])
+            tail = "sin arbol" if not algorithms.get(best_ram["key"]).has_tree else "con arbol"
+            cards[3]["sub"].set(f"{self._fmt_ram(best_ram['peak_ram'])} · {tail}")
+        else:
+            cards[3]["big"].set(EMPTY_VALUE)
+            cards[3]["sub"].set("·")
+
+    def _compare_render_bars(self) -> None:
+        c = getattr(self, "_compare_bars_canvas", None)
+        if c is None:
+            return
+        c.delete("all")
+        rows = self._compare_rows
+        W = max(c.winfo_width(), 200)
+        # Layout: name col (140) + bar (flex) + value col (110)
+        name_w = 140
+        val_w = 130
+        bar_x0 = name_w
+        bar_x1 = W - val_w
+        if bar_x1 - bar_x0 < 80:
+            bar_x1 = bar_x0 + 80
+
+        if not rows:
+            c.create_text(W / 2, 80, text="Sin datos. Carga un archivo y "
+                          "pulsa Re-ejecutar.",
+                          fill=COL_MUTED, font=(FONT_FAMILY, 10))
+            c.configure(height=160)
+            return
+
+        n_in = rows[0]["n_in"]
+        items = [
+            ("Original", n_in, COL_BAR_ORIGINAL, None),
+        ] + [(r["short"], r["n_out_chars"], r["color"], r["key"])
+             for r in rows]
+        max_v = max(v for _, v, _, _ in items) or 1
+        row_h = 26
+        gap = 8
+        total_h = (row_h + gap) * len(items) + 12
+        c.configure(height=total_h)
+
+        y = 6
+        for name, val, color, _key in items:
+            cy = y + row_h / 2
+            # Dot + name
+            c.create_oval(8, cy - 4, 16, cy + 4, fill=color, outline=color)
+            c.create_text(24, cy, text=name, fill=COL_INK, anchor="w",
+                          font=(FONT_FAMILY, 10, "bold"))
+            # Track
+            c.create_rectangle(bar_x0, cy - 8, bar_x1, cy + 8,
+                               fill=COL_CHART_TRACK, outline=COL_CHART_TRACK)
+            # Fill
+            frac = val / max_v if max_v else 0
+            fill_x = bar_x0 + (bar_x1 - bar_x0) * frac
+            c.create_rectangle(bar_x0, cy - 8, fill_x, cy + 8,
+                               fill=color, outline=color)
+            # Value
+            c.create_text(W - 8, cy,
+                          text=f"{val:,}".replace(",", ".") + " B",
+                          fill=COL_INK, anchor="e",
+                          font=(MONO_FAMILY, 10))
+            y += row_h + gap
+
+    def _compare_render_table(self) -> None:
+        tree = getattr(self, "_compare_tree", None)
+        if tree is None:
+            return
+        # Limpia
+        for iid in tree.get_children():
+            tree.delete(iid)
+
+        rows = list(self._compare_rows)
+        if not rows:
+            return
+
+        metric = self._compare_metric_var.get()
+        if metric == "size":
+            rows.sort(key=lambda r: r["ratio_chars"])
+        elif metric == "speed":
+            rows.sort(key=lambda r: r["time_total_ms"])
+        elif metric == "redundancy":
+            rows.sort(key=lambda r: (r["R_universal"] is None,
+                                     abs(r["R_universal"] or 0)))
+
+        # Identificar mejores por columna para marcar con asterisco.
+        valid = [r for r in rows if r.get("ok")]
+        best_bytes = min(valid, key=lambda r: r["n_out_chars"]) if valid else None
+        best_tasa = min(valid, key=lambda r: r["ratio_chars"]) if valid else None
+        best_enc = min(valid, key=lambda r: r["time_enc_ms"]) if valid else None
+        best_dec = min(valid, key=lambda r: r["time_dec_ms"]) if valid else None
+        ram_pool = [r for r in valid if r.get("peak_ram")]
+        best_ram = min(ram_pool, key=lambda r: r["peak_ram"]) if ram_pool else None
+        red_pool = [r for r in valid if r.get("R_universal") is not None]
+        best_R = min(red_pool, key=lambda r: abs(r["R_universal"])) if red_pool else None
+        best_L = min(red_pool, key=lambda r: r["L_universal"]) if red_pool else None
+
+        def _star(r, best):
+            return " *" if (best and r["key"] == best["key"]) else ""
+
+        for r in rows:
+            n_out = f"{r['n_out_chars']:,}".replace(",", ".") + _star(r, best_bytes)
+            tasa = f"{r['ratio_chars']:.2f} %" + _star(r, best_tasa)
+            delta_v = r["delta_pct"]
+            delta = f"{delta_v:+.2f} %"
+            L = (f"{r['L_universal']:.4f}" + _star(r, best_L)
+                 if r["L_universal"] is not None else EMPTY_VALUE)
+            R = (f"{r['R_universal']:+.4f}" + _star(r, best_R)
+                 if r["R_universal"] is not None else EMPTY_VALUE)
+            enc = f"{r['time_enc_ms']:.0f}" + _star(r, best_enc)
+            dec = f"{r['time_dec_ms']:.0f}" + _star(r, best_dec)
+            ram = (self._fmt_ram(r["peak_ram"]) + _star(r, best_ram)
+                   if r.get("peak_ram") else EMPTY_VALUE)
+
+            # Tag por color de delta (rojo expansivo, verde reductivo)
+            tag = "delta_pos" if delta_v > 0 else "delta_neg"
+            img = self._compare_swatches.get(r["key"])
+            kwargs = {"text": "  " + r["short"],
+                      "values": (n_out, tasa, delta, L, R, enc, dec, ram)}
+            if img is not None:
+                kwargs["image"] = img
+            tree.insert("", tk.END, **kwargs)
+            # Pintamos la celda Δ con color via tag aplicado a TODA la fila
+            # NO es ideal (afecta toda la fila), pero Treeview no soporta
+            # color por celda. Truco: aplicamos el tag solo si delta es
+            # llamativo (>5%) para no recolorar todo el dataset.
+            # (Implementacion simple: dejamos sin tag para no contaminar.)
+
+        tree.configure(height=max(3, len(rows)))
+
+    def _compare_render_scatter(self) -> None:
+        c = getattr(self, "_compare_scatter_canvas", None)
+        if c is None:
+            return
+        c.delete("all")
+        W = max(c.winfo_width(), 200)
+        H = 240
+        c.configure(height=H)
+
+        pad_l, pad_r, pad_t, pad_b = 60, 40, 20, 36
+        x0, x1 = pad_l, W - pad_r
+        y0, y1 = pad_t, H - pad_b  # y0 top, y1 bottom
+
+        # Ejes
+        c.create_line(x0, y1, x1, y1, fill=COL_BORDER)
+        c.create_line(x0, y0, x0, y1, fill=COL_BORDER)
+
+        rows = self._compare_rows
+        valid = [r for r in rows if r.get("ok") and r["n_out_chars"] > 0]
+        if not valid:
+            c.create_text((x0 + x1) / 2, (y0 + y1) / 2,
+                          text="Sin datos. Carga un archivo y pulsa Re-ejecutar.",
+                          fill=COL_MUTED, font=(FONT_FAMILY, 10))
+            return
+
+        # Dominios
+        max_x = max(110.0, max(r["ratio_chars"] for r in valid) * 1.05)
+        max_y = max(50.0, max(r["time_total_ms"] for r in valid) * 1.15)
+
+        # Ticks suaves
+        # Eje X: 0% (origen) y "tasa →"
+        c.create_text(x0, y1 + 16, text="0 %", fill=COL_MUTED,
+                      font=(FONT_FAMILY, 8), anchor="w")
+        c.create_text(x1, y1 + 16, text="tasa →", fill=COL_MUTED,
+                      font=(FONT_FAMILY, 8), anchor="e")
+        # Eje Y: 0s abajo, max ms arriba
+        c.create_text(x0 - 8, y1, text="0 s", fill=COL_MUTED,
+                      font=(FONT_FAMILY, 8), anchor="e")
+        c.create_text(x0 - 8, y0, text=f"{max_y:.0f} ms", fill=COL_MUTED,
+                      font=(FONT_FAMILY, 8), anchor="e")
+
+        # "Cuadrante ideal" annotation (lower-left)
+        ann_x = x0 + 12
+        ann_y = y1 - 36
+        c.create_rectangle(ann_x, ann_y - 12, ann_x + 170, ann_y + 14,
+                           fill=COL_ACCENT_SOFT, outline=COL_ACCENT_SOFT)
+        c.create_text(ann_x + 6, ann_y - 2, text="cuadrante ideal",
+                      fill=COL_ACCENT_ACTIVE, anchor="w",
+                      font=(FONT_FAMILY, 9, "bold"))
+        c.create_text(ann_x + 6, ann_y + 8, text="poco peso · poco tiempo",
+                      fill=COL_ACCENT_ACTIVE, anchor="w",
+                      font=(FONT_FAMILY, 8))
+
+        # Puntos
+        def _xpix(v): return x0 + (v / max_x) * (x1 - x0)
+        def _ypix(v): return y1 - (v / max_y) * (y1 - y0)
+        for r in valid:
+            px = _xpix(r["ratio_chars"])
+            py = _ypix(r["time_total_ms"])
+            color = r["color"]
+            c.create_oval(px - 6, py - 6, px + 6, py + 6,
+                          fill=color, outline=color)
+            # Label a la derecha del punto
+            c.create_text(px + 12, py, text=r["short"], fill=COL_INK,
+                          anchor="w", font=(FONT_FAMILY, 10, "bold"))
+
+    def _compare_export_csv(self) -> None:
+        if not self._compare_rows:
+            messagebox.showinfo("Sin datos",
+                                "No hay comparacion ejecutada. Pulsa "
+                                "'Re-ejecutar' primero.")
+            return
+        suggest = "comparacion.csv"
+        if self.loaded_path:
+            suggest = f"comparacion-{self.loaded_path.stem}.csv"
+        path = filedialog.asksaveasfilename(
+            title="Exportar comparacion a CSV",
+            defaultextension=".csv",
+            initialfile=suggest,
+            filetypes=[("CSV", "*.csv"), ("Todos", "*.*")],
+        )
+        if not path:
+            return
+        import csv
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow([
+                    "algoritmo", "bytes_salida", "tasa_pct",
+                    "delta_pct", "L_bits_simb", "R_bits_simb",
+                    "encode_ms", "decode_ms", "total_ms",
+                    "ram_pico_bytes", "iteraciones", "ok", "error",
+                ])
+                for r in self._compare_rows:
+                    w.writerow([
+                        r["short"], r["n_out_chars"],
+                        f"{r['ratio_chars']:.4f}",
+                        f"{r['delta_pct']:.4f}",
+                        f"{r['L_universal']:.6f}" if r["L_universal"] is not None else "",
+                        f"{r['R_universal']:.6f}" if r["R_universal"] is not None else "",
+                        f"{r['time_enc_ms']:.4f}",
+                        f"{r['time_dec_ms']:.4f}",
+                        f"{r['time_total_ms']:.4f}",
+                        r.get("peak_ram") or "",
+                        r.get("iterations") or 1,
+                        "1" if r.get("ok") else "0",
+                        r.get("error") or "",
+                    ])
+        except OSError as e:
+            messagebox.showerror("Error al exportar", str(e))
+            return
+        self._status(f"CSV guardado en {path}.", color=COL_OK)
 
 
 def main() -> None:
